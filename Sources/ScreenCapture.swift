@@ -151,11 +151,16 @@ public final class ScreenCapture {
             return img.cgImage(forProposedRect: nil, context: nil, hints: nil)
         }
         
+        // Bundle-relative fallbacks only (portable across machines)
+        if let classBundleUrl = Bundle(for: ScreenCapture.self).url(forResource: "default", withExtension: "png"),
+           let img = NSImage(contentsOf: classBundleUrl) {
+            return img.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        }
+
         let fallbackPaths = [
             Bundle.main.bundlePath + "/Contents/Resources/default.png",
             Bundle.main.bundlePath + "/Resources/default.png",
-            CommandLine.arguments[0].split(separator: "/").dropLast().joined(separator: "/") + "/Resources/default.png",
-            "/Users/ca5/Desktop/iphone-duo-macos-animation/Resources/default.png"
+            CommandLine.arguments[0].split(separator: "/").dropLast().joined(separator: "/") + "/Resources/default.png"
         ]
         for path in fallbackPaths {
             if let img = NSImage(contentsOfFile: path),

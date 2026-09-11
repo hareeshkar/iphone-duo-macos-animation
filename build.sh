@@ -107,8 +107,6 @@ fi
 
 if [ -d "$DIR/Resources/Untitled.icon" ]; then
     cp -R "$DIR/Resources/Untitled.icon" "$RESOURCES_DIR/Untitled.icon"
-elif [ -d "/Users/ca5/Desktop/Untitled.icon" ]; then
-    cp -R "/Users/ca5/Desktop/Untitled.icon" "$RESOURCES_DIR/Untitled.icon"
 fi
 
 if [ -f "$DIR/Resources/default.png" ]; then
