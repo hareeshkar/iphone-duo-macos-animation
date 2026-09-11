@@ -189,6 +189,16 @@ public final class LidSensor {
             hidQueue.async { [weak self] in
                 guard let self else { return }
                 self.setupManager()
+                // mach_absolute_time freezes during sleep: the hoisted 1Hz
+                // gate would otherwise serve up to 1s of pre-sleep registry
+                // truth. Poll explicitly once on this path (cheap, one-shot).
+                let state = self.clamshellRegistryState()
+                let pollTime = CACurrentMediaTime()
+                self.onMain { [weak self] in
+                    self?.cachedClamshellPresent = state.present
+                    self?.cachedClamshellClosed = state.closed
+                    self?.lastClamshellPoll = pollTime
+                }
                 self.reopenHIDIfNeeded()
                 if reschedule {
                     DispatchQueue.main.async { [weak self] in
@@ -312,14 +322,27 @@ public final class LidSensor {
         self.hidDevice = nil
         self.isDeviceOpen = false
         hidStateLock.unlock()
-        let closed = isLidClosedViaIORegistry()
-        onMain {
+        // Registry read is a blocking IOKit walk (fine on hidQueue/init);
+        // all published state funnels through onMain, and the shared cache
+        // seeds here so no consumer ever reads a half-initialized pair.
+        let state = clamshellRegistryState()
+        // Main-confined write only: tick() reads this on main, and this
+        // function runs on hidQueue post-wake (where the onMain block below
+        // carries the value instead). No cross-thread direct writes, ever.
+        if Thread.isMainThread {
+            lastKnownClamshellClosed = state.closed
+        }
+        onMain { [weak self] in
+            guard let self else { return }
+            self.cachedClamshellPresent = state.present
+            self.cachedClamshellClosed = state.closed
+            self.lastClamshellPoll = CACurrentMediaTime()
+            self.lastKnownClamshellClosed = state.closed
             AppSettings.shared.isHardwareSensor = false
             AppSettings.shared.isClamshellMode = true
             AppSettings.shared.isSensorConnected = true
             AppSettings.shared.sensorStatusMessage = "Clamshell Mode Active (MacBook Neo / M1 — Auto Sleep & Wake Animation Enabled)"
         }
-        lastKnownClamshellClosed = closed
     }
     
     /// Physical lid-closed signal for the overlay's clamshell suppression.
@@ -351,10 +374,6 @@ public final class LidSensor {
         return (false, false)
     }
 
-    private func isLidClosedViaIORegistry() -> Bool {
-        clamshellRegistryState().closed
-    }
-    
     // MARK: - Clamshell Mode Simulations (MacBook Neo & M1)
     
     public func animateUnfold() {
