@@ -160,11 +160,15 @@ public final class OverlayWindowController: NSObject {
         self.window = win
         self.metalView = mtkView
         
-        // One-time initial image load in background during app launch
+        // One-time initial image load in background during app launch.
+        // Provenance travels with it: a permissionless-launch wallpaper fill
+        // reports non-live, so the show gate re-fetches once live is granted
+        // instead of posing wallpaper as desktop.
         Task(priority: .utility) {
-            if let img = await ScreenCapture.shared.fetchImage() {
+            let result = await ScreenCapture.shared.fetchImage()
+            if let img = result.image {
                 await MainActor.run {
-                    self.metalView?.updateImage(img)
+                    self.metalView?.updateImage(img, isLive: result.isLive)
                     AppSettings.shared.lastCaptureDate = Date()
                     AppSettings.shared.isScreenCaptureDormant = true
                 }
@@ -366,12 +370,11 @@ public final class OverlayWindowController: NSObject {
     /// texture-generation newest-wins arbitrates overlap. Dropping the newest
     /// behind an in-flight fetch once showed stale frames, so we never drop.
     /// Resolution tiered by panel density (1x externals stay full-res).
-    /// Single texture-reload factory for all modes — and the manual-refresh
-    /// entry point for the menu bar and settings panel. One cancellable task;
-    /// texture-generation newest-wins arbitrates overlap. Dropping the newest
-    /// behind an in-flight fetch once showed stale frames, so we never drop.
-    /// Resolution tiered by panel density (1x externals stay full-res).
+    /// Main-thread only (reads NSScreen): enforced by precondition, because a
+    /// mistyped @MainActor here cascades into the synchronous tick → update
+    /// hot path, which cannot await. Fail fast, never silently off-main.
     public func captureScreenAsync() {
+        dispatchPrecondition(condition: .onQueue(.main))
         foldTask?.cancel()
         AppSettings.shared.isScreenCaptureDormant = false
 
@@ -379,8 +382,8 @@ public final class OverlayWindowController: NSObject {
         // pixel hashing — the old FNV bridged the full IOSurface-backed Data
         // (7-30MB readback) to "save" an already-backgrounded upload, and
         // strided sampling could alias into stale frames. Always upload.
-        // @MainActor-isolated: the awaits suspend without blocking, and the
-        // pattern is Sendable-clean (proven by typecheck, Swift 6 mode).
+        // @MainActor-isolated task: the awaits suspend without blocking, and
+        // the pattern is Sendable-clean (proven by typecheck, Swift 6 mode).
         // Identity-guarded teardown: a cancelled predecessor runs to
         // completion (fetch isn't cancellation-aware) and must not orphan a
         // newer task by nil-ing the shared handle out from under it. Task is
@@ -390,14 +393,14 @@ public final class OverlayWindowController: NSObject {
         foldTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let live = AppSettings.shared.imageSourceMode == .liveCapture
-            let image: CGImage?
+            let result: (image: CGImage?, isLive: Bool)
             if live {
-                image = await ScreenCapture.shared.fetchImage(scaleFactor: self.captureScaleFactor)
+                result = await ScreenCapture.shared.fetchImage(scaleFactor: self.captureScaleFactor)
             } else {
-                image = await ScreenCapture.shared.fetchImage()
+                result = await ScreenCapture.shared.fetchImage()
             }
-            if let image {
-                self.metalView?.updateImage(image, isLive: live)
+            if let image = result.image {
+                self.metalView?.updateImage(image, isLive: result.isLive)
                 AppSettings.shared.lastCaptureDate = Date()
             }
             if self.foldGeneration == generation {
@@ -409,7 +412,9 @@ public final class OverlayWindowController: NSObject {
 
     /// Capture resolution tier: full pixels on 1x panels (960x540-upscaled
     /// would be a blurry mess side-by-side with the live desktop), half on
-    /// Retina where the blur/LOD chain resolves no more. Main-thread only.
+    /// Retina where the blur/LOD chain resolves no more. Main-thread only;
+    /// read only from main-confined callers (show path, capture factory).
+    @MainActor
     private var captureScaleFactor: CGFloat {
         (NSScreen.main?.backingScaleFactor ?? 2.0) <= 1.0 ? 1.0 : 0.5
     }

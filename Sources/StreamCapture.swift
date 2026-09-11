@@ -251,10 +251,8 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
         guard result == kCVReturnSuccess,
               let cvTexture,
               let texture = CVMetalTextureGetTexture(cvTexture) else {
-            lock.unlock()
             return nil
         }
-        lock.unlock()
         return (texture, width, height, cvTexture)
     }
 }

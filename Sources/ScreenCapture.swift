@@ -105,36 +105,42 @@ public final class ScreenCapture {
     }
     
     /// Capture the screen or load appropriate image based on settings.
-    /// scaleFactor: 1.0 preserves the razor-sharp fold-start frame (compared
-    /// side-by-side with the live desktop); 0.5 quarters cost once blur hides
-    /// detail. Callers choose by fold turn.
-    public func fetchImage(scaleFactor: CGFloat = 0.5) async -> CGImage? {
+    /// Returns provenance with the pixels: isLive is true ONLY on the
+    /// captureLiveScreen success branch. Every fallback (no permission,
+    /// capture failure, wallpaper/art/custom modes) reports false — the mode
+    /// is not the pixels, and the show gate depends on the distinction.
+    /// scaleFactor tiers resolution by panel density (callers' choice).
+    public func fetchImage(scaleFactor: CGFloat = 0.5) async -> (image: CGImage?, isLive: Bool) {
         let settings = AppSettings.shared
-        
+
         switch settings.imageSourceMode {
         case .liveCapture:
             // Hot path: fast synchronous preflight only. The full async probe
             // (enumeration + test capture) runs on didBecomeActive via
             // AppSettings.refreshPermissions — never per fold frame.
             if hasPermission(), let img = await captureLiveScreen(scaleFactor: scaleFactor) {
-                return img
+                return (img, true)
             }
-            // Fallback if permission not granted or capture failed
-            return fetchWallpaperImage() ?? fetchBundledDefaultImage()
-            
+            // Fallback if permission not granted or capture failed. Wallpaper
+            // is MainActor-confined (AppKit); hop explicitly — fetchImage
+            // itself stays nonisolated so background tasks can await it.
+            let wallpaper = await MainActor.run { fetchWallpaperImage() }
+            return (wallpaper ?? fetchBundledDefaultImage(), false)
+
         case .desktopWallpaper:
-            return fetchWallpaperImage() ?? fetchBundledDefaultImage()
-            
+            let wallpaper = await MainActor.run { fetchWallpaperImage() }
+            return (wallpaper ?? fetchBundledDefaultImage(), false)
+
         case .bundledArtwork:
-            return fetchBundledDefaultImage()
-            
+            return (fetchBundledDefaultImage(), false)
+
         case .customImage:
             if !settings.customImagePath.isEmpty,
                let image = NSImage(contentsOfFile: settings.customImagePath),
                let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-                return cgImage
+                return (cgImage, false)
             }
-            return fetchBundledDefaultImage()
+            return (fetchBundledDefaultImage(), false)
         }
     }
     
@@ -200,7 +206,10 @@ public final class ScreenCapture {
         return filter
     }
     
-    /// Get user's current desktop wallpaper
+    /// Get user's current desktop wallpaper. Main-actor confined: NSScreen
+    /// and NSWorkspace desktop queries are main-thread-only, and this is
+    /// reachable from background tasks via fetchImage.
+    @MainActor
     public func fetchWallpaperImage() -> CGImage? {
         guard let screen = NSScreen.main,
               let url = NSWorkspace.shared.desktopImageURL(for: screen),

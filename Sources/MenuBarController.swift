@@ -203,7 +203,7 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
         }
     }
     
-    @objc private func recaptureScreen() {
+    @objc @MainActor private func recaptureScreen() {
         OverlayWindowController.shared.captureScreenAsync()
     }
     
