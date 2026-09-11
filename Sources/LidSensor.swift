@@ -48,7 +48,6 @@ public final class LidSensor {
     public private(set) var currentRawAngle: Double = 120.0
     private var isActivelyClosing: Bool = false
     private var hasPreArmedInThisMotion: Bool = false
-    private var lastPreArmTime: CFTimeInterval = 0
 
     // Clamshell truthfulness: smoothed angular velocity (deg/sec, negative = closing).
     // Derived from actual HID sample timestamps — immune to timer-phase aliasing.
@@ -67,7 +66,6 @@ public final class LidSensor {
     // not trail it.
     private var predX: Double = 120.0
     private var predV: Double = 0.0
-    private var stillnessConfirmed = false
     private static let predLeadTime: Double = 0.06
     private static let predMaxLead: Double = 8.0
 
@@ -98,9 +96,10 @@ public final class LidSensor {
             predV = 0
             return
         }
-        // Predict to the sample instant, then correct. β scaled to dt
-        // relative to the 60Hz nominal design point: consistent noise gain.
-        let beta = min(max(0.08 * dt * 60.0, 0.02), 0.3)
+        // Predict to the sample instant, then correct. Fixed β: the residual
+        // is already dt-normalized (β·residual/dt), so scheduling β with dt
+        // on top double-counts the rate and pumps noise across 10→120Hz.
+        let beta = 0.08
         let xPred = predX + predV * dt
         let residual = angle - xPred
         predX = xPred + 0.35 * residual
@@ -108,13 +107,13 @@ public final class LidSensor {
     }
 
     /// Lead angle driving targetTurn. Frozen to measured unless actively
-    /// tracking (fresh samples flowing AND stillness not confirmed) — it can
+    /// tracking (live samples flowing AND stillness not confirmed) — it can
     /// never overshoot a stop, a reversal, or a sensor dropout. Notably, slow
     /// stared-at folds keep their lead: the gate is confirmed stillness
     /// (200ms), not the first quiet tick. Capture thresholds and published
     /// angles stay on measured values; only the rendered turn leads.
-    private func predictedAngle(measured: Double, tracking: Bool) -> Double {
-        guard tracking, !stillnessConfirmed else { return measured }
+    private func predictedAngle(measured: Double, tracking: Bool, still: Bool) -> Double {
+        guard tracking, !still else { return measured }
         let lead = predX + predV * Self.predLeadTime
         return min(max(lead, measured - Self.predMaxLead, 0.0),
                    measured + Self.predMaxLead, 180.0)
@@ -318,8 +317,17 @@ public final class LidSensor {
         lastKnownClamshellClosed = closed
     }
     
-    private func isLidClosedViaIORegistry() -> Bool {
-        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    /// Physical lid-closed signal for the overlay's clamshell suppression:
+    /// registry state on no-sensor Macs (1Hz cache), near-shut angle on
+    /// hardware-sensor Macs. Main-thread only (reads published state).
+    public var isLidPhysicallyClosed: Bool {
+        if AppSettings.shared.isClamshellMode {
+            return cachedClamshellClosed
+        }
+        return currentRawAngle < AppSettings.shared.endTiltAngle + 5.0
+    }
+
+    private func isLidClosedViaIORegistry() -> Bool {        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
         guard root != 0 else { return false }
         defer { IOObjectRelease(root) }
         
@@ -607,6 +615,12 @@ public final class LidSensor {
                 }
             }
 
+            // Tracks whether this tick consumed a live sample: the predictor
+            // leads only on live data, never coasting through a dropout.
+            // leadHoldStill freezes the lead on confirmed stillness.
+            var trackingSample = false
+            var leadHoldStill = true
+
             if readOK {
                 let nowTick = CACurrentMediaTime()
                 // Direction steered by dt-normalized VELOCITY (deg/sec), not
@@ -625,6 +639,7 @@ public final class LidSensor {
                     prevConsumedAngle = angle
                     prevConsumedSampleTime = sampleTime
                     hasFreshSample = true
+                    trackingSample = true
                 } else {
                     // Time-consistent decay (τ=80ms), not a per-tick factor:
                     // the 10Hz path must forget faster per tick than 120Hz.
@@ -642,25 +657,41 @@ public final class LidSensor {
                 if isMovingDownward {
                     isActivelyClosing = true
                     stillSince = nil
-                    stillnessConfirmed = false
                 } else if isMovingUpward {
                     isActivelyClosing = false
                     hasPreArmedInThisMotion = false
                     stillSince = nil
-                    stillnessConfirmed = false
+                    // Committed reversal: kill stale closing velocity now, not
+                    // 200ms later — otherwise the lead pushes further closed
+                    // while the finger opens.
+                    predV = 0
                 } else {
-                    // Time-based stillness (200ms), not frame-counted: the
-                    // adaptive clock runs 10..120Hz, so frame counts lie.
-                    if stillSince == nil {
+                    // Sub-threshold drift with live samples counts as motion:
+                    // after any hesitation, a slow resume must re-arm the
+                    // lead instead of latching leadless until a fast flick.
+                    if hasFreshSample && abs(instVelocity) > 2.5 {
+                        stillSince = nil
+                    } else if stillSince == nil {
+                        // Time-based stillness (200ms), not frame-counted: the
+                        // adaptive clock runs 10..120Hz, so frame counts lie.
                         stillSince = nowTick
                     } else if nowTick - stillSince! > 0.2 {
                         isActivelyClosing = false
-                        stillnessConfirmed = true
                         // Freeze the predictor with the stop: stale velocity
                         // would otherwise overshoot into the reversal.
                         predV = 0
                     }
                 }
+                // Confirmed stillness is a pure function of (stillSince, now):
+                // no second flag to drift out of sync with the first.
+                leadHoldStill = stillSince.map { nowTick - $0 > 0.2 } ?? false
+                // Confirmed stillness is a pure function of (stillSince, now):
+                // no second flag to drift out of sync with the first.
+                let still: Bool = {
+                    guard let since = stillSince else { return false }
+                    return nowTick - since > 0.2
+                }()
+                leadHoldStill = still
 
                 // If lid is safely open, reset pre-arm latch and mark capture engine dormant
                 if angle >= settings.startTiltAngle || (!isActivelyClosing && angle >= settings.startTiltAngle - 10.0) {
@@ -668,13 +699,16 @@ public final class LidSensor {
                     settings.isScreenCaptureDormant = true
                 }
 
-                // Hardware Pre-Arming Capture Zone (widened: capture is cheap now)
-                let nowTime = CACurrentMediaTime()
-                let preArmThreshold = min(140.0, settings.startTiltAngle + 25.0)
+                // Hardware Pre-Arming Capture Zone: threshold scales with close
+                // speed so slams prime earlier (stream start costs 30-150ms).
+                // The motion latch (not a time throttle) gives once-per-motion:
+                // a quicker re-prime on open→re-close is strictly better, and
+                // prime() is a no-op when already warm.
+                let closeSpeed = min(max(-smoothedVelocity, 0.0), 600.0)
+                let preArmThreshold = min(160.0, settings.startTiltAngle + 25.0 + closeSpeed * 0.03)
                 if angle <= preArmThreshold && angle < settings.startTiltAngle {
-                    if !hasPreArmedInThisMotion && (nowTime - lastPreArmTime > 2.0) {
+                    if !hasPreArmedInThisMotion {
                         hasPreArmedInThisMotion = true
-                        lastPreArmTime = nowTime
                         settings.isScreenCaptureDormant = false
                         onPreArmCapture?()
                     }
@@ -688,9 +722,9 @@ public final class LidSensor {
             
             // Target turn leads the finger: predicted angle masks HID + pipeline
             // latency. Measured angle still drives capture thresholds and UI.
-            // tracking=readOK: during dropout the predictor coasts on frozen
-            // velocity, so the turn holds measured until samples resume.
-            targetTurn = settings.normalizedTurn(for: predictedAngle(measured: currentRawAngle, tracking: readOK))
+            // Leads only on live samples: dropout holds measured, confirmed
+            // stillness holds measured, everything else leads up to ±8°.
+            targetTurn = settings.normalizedTurn(for: predictedAngle(measured: currentRawAngle, tracking: trackingSample, still: leadHoldStill))
             
             // Follow easing physics
             let now = CACurrentMediaTime()
@@ -741,7 +775,8 @@ public final class LidSensor {
                     currentRawAngle = simulationTargetAngle
                     settings.currentLidAngle = currentRawAngle
                 }
-            } else if settings.isTestModeActive {                displayTurn = settings.normalizedTurn(for: 120.0)
+            } else if settings.isTestModeActive {
+                displayTurn = settings.normalizedTurn(for: 120.0)
                 currentRawAngle = 120.0 - displayTurn * 85.0
                 settings.currentLidAngle = currentRawAngle
             } else {
@@ -749,6 +784,9 @@ public final class LidSensor {
                 currentRawAngle = 120.0
                 settings.currentLidAngle = 120.0
             }
+            // Off-hardware paths drive displayTurn directly: keep the public
+            // targetTurn honest instead of leaking a stale hardware value.
+            targetTurn = displayTurn
         }
         
         adaptPollInterval(angle: currentRawAngle)
