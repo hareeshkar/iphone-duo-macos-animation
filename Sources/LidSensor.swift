@@ -57,6 +57,65 @@ public final class LidSensor {
     private var prevConsumedSampleTime: CFTimeInterval = 0
     private var stillSince: CFTimeInterval? = nil
 
+    // α-β-γ predictor state (main-confined, tick context): masks the
+    // residual 30-80ms phase lag (HID poll + pipeline + capture age) so the
+    // fold leads the finger instead of trailing it. Fixed gains are the
+    // steady-state Kalman for constant process/measurement noise — a full
+    // Kalman buys nothing here. Prediction is clamped and frozen on
+    // stillness/reversal: predictors overshoot exactly when motion stops.
+    private var predX: Double = 120.0
+    private var predV: Double = 0.0
+    private var predA: Double = 0.0
+    private var predTime: CFTimeInterval = 0
+    private static let predLeadTime: Double = 0.045
+    private static let predMaxLead: Double = 8.0
+    private static let predMaxAccel: Double = 2000.0
+
+    /// α-β-γ filter step on a fresh HID sample. Gains are the steady-state
+    /// Kalman for constant process/measurement noise — a full Kalman buys
+    /// nothing here. Accel is clamped: dt² in the γ denominator explodes on
+    /// near-simultaneous samples.
+    private func updatePredictor(angle: Double, sampleTime: CFTimeInterval) {
+        if predTime <= 0 {
+            predX = angle
+            predV = 0
+            predA = 0
+            predTime = sampleTime
+            return
+        }
+        let dt = max(sampleTime - predTime, 1.0 / 240.0)
+        // Discontinuity (sleep/wake gap, re-enumeration): snap, never predict
+        // through it — a 100° jump would fling the lead angle.
+        if dt > 1.0 || abs(angle - predX) > 30.0 {
+            predX = angle
+            predV = 0
+            predA = 0
+            predTime = sampleTime
+            return
+        }
+        // Predict to the sample instant, then correct with the measurement.
+        let xPred = predX + predV * dt + 0.5 * predA * dt * dt
+        let vPred = predV + predA * dt
+        let residual = angle - xPred
+        predX = xPred + 0.35 * residual
+        predV = vPred + 0.08 * residual / dt
+        predA = min(max(predA + 0.005 * residual / (0.5 * dt * dt),
+                        -Self.predMaxAccel), Self.predMaxAccel)
+        predTime = sampleTime
+    }
+
+    /// Lead-angle prediction driving targetTurn. Clamped to ±8° of the last
+    /// measured sample and to physical range; frozen to measured once
+    /// stillness engages, so it can never overshoot a stop or a reversal.
+    /// Capture thresholds and published angles stay on measured values —
+    /// only the rendered turn leads.
+    private func predictedAngle(measured: Double) -> Double {
+        guard stillSince == nil else { return measured }
+        let lead = predX + predV * Self.predLeadTime
+        return min(max(lead, measured - Self.predMaxLead, 0.0),
+                   measured + Self.predMaxLead, 180.0)
+    }
+
     // Adaptive polling: Feature Reports must be polled (no Input Reports from LAS),
     // so vary the rate instead — 10Hz idle, 60Hz armed, 120Hz while closing.
     private var workspaceObservers: [NSObjectProtocol] = []
@@ -558,6 +617,7 @@ public final class LidSensor {
                         instVelocity = min(max((angle - prevConsumedAngle) / dtSample, -1200.0), 1200.0)
                         smoothedVelocity += (instVelocity - smoothedVelocity) * 0.25
                     }
+                    updatePredictor(angle: angle, sampleTime: sampleTime)
                     prevConsumedAngle = angle
                     prevConsumedSampleTime = sampleTime
                     hasFreshSample = true
@@ -589,6 +649,10 @@ public final class LidSensor {
                         stillSince = nowTick
                     } else if nowTick - stillSince! > 0.2 {
                         isActivelyClosing = false
+                        // Freeze the predictor with the stop: stale velocity
+                        // would otherwise overshoot into the reversal.
+                        predV = 0
+                        predA = 0
                     }
                 }
 
@@ -616,8 +680,9 @@ public final class LidSensor {
                 settings.isSensorConnected = true
             }
             
-            // Compute target turn: continuously mirrors physical angle across full range
-            targetTurn = settings.normalizedTurn(for: currentRawAngle)
+            // Target turn leads the finger: predicted angle masks HID + pipeline
+            // latency. Measured angle still drives capture thresholds and UI.
+            targetTurn = settings.normalizedTurn(for: predictedAngle(measured: currentRawAngle))
             
             // Follow easing physics
             let now = CACurrentMediaTime()
