@@ -36,9 +36,11 @@ public final class LidSensor {
     // the clock to 10Hz. Zero = no pin.
     private var ratePinInterval: Double = 0
     private var ratePinUntil: CFTimeInterval = 0
-    // Clamshell-path IOKit cache: IOService matching + registry reads every
-    // tick is a kernel IPC at 10..120Hz for every no-sensor Mac. 1Hz is plenty.
+    // Clamshell registry cache shared by BOTH paths: the 1Hz IOService walk
+    // is too costly per-tick, and the suppression gate needs registry truth
+    // on hardware-sensor Macs too (angle folklore must not gate correctness).
     private var lastClamshellPoll: CFTimeInterval = 0
+    private var cachedClamshellPresent: Bool = false
     private var cachedClamshellClosed: Bool = false
     
     // Physics and motion tracking
@@ -96,9 +98,12 @@ public final class LidSensor {
             predV = 0
             return
         }
-        // Predict to the sample instant, then correct. Fixed β: the residual
-        // is already dt-normalized (β·residual/dt), so scheduling β with dt
-        // on top double-counts the rate and pumps noise across 10→120Hz.
+        // Predict to the sample instant, then correct. Fixed β in canonical
+        // g-h form (v += β·r/Δt): the /Δt already converts residual to
+        // velocity units, so this neither schedules with rate nor claims
+        // optimality across the 12× clock swing — steady-state Keesman/BB
+        // optimality assumes fixed T. What bounds the error in practice is
+        // the ±8° lead clamp plus stillness/dropout freezing, not the gain.
         let beta = 0.08
         let xPred = predX + predV * dt
         let residual = angle - xPred
@@ -317,24 +322,37 @@ public final class LidSensor {
         lastKnownClamshellClosed = closed
     }
     
-    /// Physical lid-closed signal for the overlay's clamshell suppression:
-    /// registry state on no-sensor Macs (1Hz cache), near-shut angle on
-    /// hardware-sensor Macs. Main-thread only (reads published state).
+    /// Physical lid-closed signal for the overlay's clamshell suppression.
+    /// Registry-first: AppleClamshellState is authoritative on all Macs and
+    /// needs no per-machine angle folklore. The raw-angle fallback (fixed
+    /// 15°, never the user-tunable endTiltAngle) covers only machines where
+    /// the key is absent (VMs). A calibration knob must never drive a
+    /// correctness gate. Main-thread only (reads published state).
     public var isLidPhysicallyClosed: Bool {
-        if AppSettings.shared.isClamshellMode {
+        if cachedClamshellPresent {
             return cachedClamshellClosed
         }
-        return currentRawAngle < AppSettings.shared.endTiltAngle + 5.0
-    }
-
-    private func isLidClosedViaIORegistry() -> Bool {        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
-        guard root != 0 else { return false }
-        defer { IOObjectRelease(root) }
-        
-        if let prop = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber {
-            return prop.boolValue
+        if AppSettings.shared.isHardwareSensor {
+            return currentRawAngle < 15.0
         }
         return false
+    }
+
+    /// Single IOKit walk answering both presence and state: absence (desktop
+    /// Macs, VMs) is data, not failure.
+    private func clamshellRegistryState() -> (present: Bool, closed: Bool) {
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard root != 0 else { return (false, false) }
+        defer { IOObjectRelease(root) }
+
+        if let prop = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber {
+            return (true, prop.boolValue)
+        }
+        return (false, false)
+    }
+
+    private func isLidClosedViaIORegistry() -> Bool {
+        clamshellRegistryState().closed
     }
     
     // MARK: - Clamshell Mode Simulations (MacBook Neo & M1)
@@ -594,7 +612,18 @@ public final class LidSensor {
     
     private func tick() {
         let settings = AppSettings.shared
-        
+
+        // Shared 1Hz registry truth for BOTH paths: the IOService walk is a
+        // kernel table walk, and the overlay's suppression gate needs registry
+        // truth on hardware-sensor Macs too (angle folklore gates nothing).
+        let nowReg = CACurrentMediaTime()
+        if nowReg - lastClamshellPoll > 1.0 {
+            lastClamshellPoll = nowReg
+            let state = clamshellRegistryState()
+            cachedClamshellPresent = state.present
+            cachedClamshellClosed = state.closed
+        }
+
         if settings.isHardwareSensor {
             // Consume the latest angle sampled on hidQueue. Main thread never
             // blocks on the kernel here — worst case we reuse last tick's value.
@@ -684,9 +713,6 @@ public final class LidSensor {
                 }
                 // Confirmed stillness is a pure function of (stillSince, now):
                 // no second flag to drift out of sync with the first.
-                leadHoldStill = stillSince.map { nowTick - $0 > 0.2 } ?? false
-                // Confirmed stillness is a pure function of (stillSince, now):
-                // no second flag to drift out of sync with the first.
                 let still: Bool = {
                     guard let since = stillSince else { return false }
                     return nowTick - since > 0.2
@@ -743,13 +769,8 @@ public final class LidSensor {
                 displayTurn = targetTurn
             }
         } else {
-            // Clamshell Mode (MacBook Neo, M1, etc.) — registry polled at 1Hz
-            // and cached; per-tick IOService matching is a kernel table walk.
-            let nowClam = CACurrentMediaTime()
-            if nowClam - lastClamshellPoll > 1.0 {
-                lastClamshellPoll = nowClam
-                cachedClamshellClosed = isLidClosedViaIORegistry()
-            }
+            // Clamshell Mode (MacBook Neo, M1, etc.) — registry truth shared
+            // from the hoisted 1Hz poll above.
             let currentClosed = cachedClamshellClosed
             if currentClosed != lastKnownClamshellClosed {
                 lastKnownClamshellClosed = currentClosed
