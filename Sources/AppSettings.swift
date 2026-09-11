@@ -2,6 +2,36 @@ import Foundation
 import Combine
 import SwiftUI
 
+public enum FeelPreset: Int, CaseIterable, Identifiable {
+    case gentle = 0
+    case balanced = 1
+    case sharp = 2
+    case custom = 3
+
+    public var id: Int { rawValue }
+
+    public var title: String {
+        switch self {
+        case .gentle: return "Gentle"
+        case .balanced: return "Balanced"
+        case .sharp: return "Sharp"
+        case .custom: return "Custom"
+        }
+    }
+
+    /// Joint follow/blur/shine recipe. Follow and prediction lead stay
+    /// coupled by construction (lead derives from follow in LidSensor), so
+    /// no preset can decouple tracking bandwidth from anticipation into
+    /// floaty-fake territory. Values validated in the physics review.
+    public var recipe: (follow: Double, blur: Double, shine: Double) {
+        switch self {
+        case .gentle: return (11.0, 0.8, 0.4)
+        case .balanced: return (16.0, 0.5, 0.0)
+        case .sharp: return (24.0, 0.2, 0.0)
+        case .custom: return (16.0, 0.5, 0.0)
+        }
+    }
+}
 public enum ImageSourceMode: Int, CaseIterable, Identifiable {
     case liveCapture = 0
     case desktopWallpaper = 1
@@ -35,6 +65,8 @@ public final class AppSettings: ObservableObject {
     private let kEnableLockScreenPriority = "mactilt_enable_lock_screen_priority"
     private let kHasCompletedOnboarding = "mactilt_hasCompletedOnboarding"
     private let kAutomaticallyCheckForUpdates = "mactilt_automaticallyCheckForUpdates"
+    private let kFeelPreset = "mactilt_feelPreset"
+    private let kEnableWarmStream = "mactilt_enableWarmStream"
     
     // MARK: - Customizable Animation Options
     @Published public var automaticallyCheckForUpdates: Bool {
@@ -86,6 +118,28 @@ public final class AppSettings: ObservableObject {
             OverlayWindowController.shared.updateWindowLevel()
         }
     }
+
+    @Published public var feelPreset: FeelPreset {
+        didSet { UserDefaults.standard.set(feelPreset.rawValue, forKey: kFeelPreset) }
+    }
+
+    @Published public var enableWarmStream: Bool {
+        didSet {
+            UserDefaults.standard.set(enableWarmStream, forKey: kEnableWarmStream)
+            StreamCapture.fastPathEnabled = enableWarmStream
+        }
+    }
+
+    /// Apply a feel preset's joint recipe. Sliders moving afterwards flip the
+    /// picker to Custom in the view — presets are starting points, never locks.
+    public func applyFeelPreset(_ preset: FeelPreset) {
+        guard preset != .custom else { return }
+        let recipe = preset.recipe
+        followSpeed = recipe.follow
+        blurStrength = recipe.blur
+        reflectionIntensity = recipe.shine
+        feelPreset = preset
+    }
     
     // MARK: - Real-time State
     @Published public var isTestModeActive: Bool = false {
@@ -127,6 +181,12 @@ public final class AppSettings: ObservableObject {
         self.showAngleInMenuBar = defaults.object(forKey: kShowAngleInMenuBar) != nil ? defaults.bool(forKey: kShowAngleInMenuBar) : true
         self.enableLockScreenPriority = defaults.object(forKey: kEnableLockScreenPriority) != nil ? defaults.bool(forKey: kEnableLockScreenPriority) : true
         self.automaticallyCheckForUpdates = defaults.object(forKey: kAutomaticallyCheckForUpdates) != nil ? defaults.bool(forKey: kAutomaticallyCheckForUpdates) : true
+
+        let savedPreset = defaults.integer(forKey: kFeelPreset)
+        self.feelPreset = defaults.object(forKey: kFeelPreset) != nil ? (FeelPreset(rawValue: savedPreset) ?? .balanced) : .balanced
+
+        self.enableWarmStream = defaults.object(forKey: kEnableWarmStream) != nil ? defaults.bool(forKey: kEnableWarmStream) : true
+        StreamCapture.fastPathEnabled = self.enableWarmStream
         
         // Listen for app becoming active to re-check permissions immediately
         appActiveObserver = NotificationCenter.default.addObserver(

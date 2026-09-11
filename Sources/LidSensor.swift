@@ -68,8 +68,15 @@ public final class LidSensor {
     // not trail it.
     private var predX: Double = 120.0
     private var predV: Double = 0.0
-    private static let predLeadTime: Double = 0.06
     private static let predMaxLead: Double = 8.0
+
+    /// Prediction lead derived from follow speed: T_lead ≈ τ − 2.5ms clamped
+    /// to the validated 40–75ms band. Derived, never stored or exposed alone —
+    /// decoupling tracking bandwidth from anticipation is exactly how a fold
+    /// turns floaty-fake, so the construction makes it unrepresentable.
+    private static func effectiveLeadTime(followSpeed: Double) -> Double {
+        min(max(1.0 / max(8.0, followSpeed) - 0.0025, 0.04), 0.075)
+    }
 
     /// α-β step on a fresh HID sample. β is scheduled with dt: fixed gains
     /// are only steady-state-optimal at a fixed rate, and our clock swings
@@ -119,7 +126,7 @@ public final class LidSensor {
     /// angles stay on measured values; only the rendered turn leads.
     private func predictedAngle(measured: Double, tracking: Bool, still: Bool) -> Double {
         guard tracking, !still else { return measured }
-        let lead = predX + predV * Self.predLeadTime
+        let lead = predX + predV * Self.effectiveLeadTime(followSpeed: AppSettings.shared.followSpeed)
         return min(max(lead, measured - Self.predMaxLead, 0.0),
                    measured + Self.predMaxLead, 180.0)
     }
