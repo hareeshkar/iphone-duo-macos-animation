@@ -71,8 +71,9 @@ public final class SkyLightOperator {
     
     /// Move a window to the topmost lock-screen SkyLight space.
     /// Guard first: a never-shown window (number 0) must not keep the
-    /// reserved level with no space membership. On space-move failure the
-    /// level resets to .screenSaver so the window degrades honestly.
+    /// reserved level with no space membership. A failed space move resets
+    /// to .screenSaver so the window degrades honestly instead of sitting at
+    /// Int32.max-2 outside any space.
     @discardableResult
     public func delegateWindow(_ window: NSWindow) -> Bool {
         guard isAvailable, let addFn = SLSSpaceAddWindowsAndRemoveFromSpaces else {
@@ -86,7 +87,11 @@ public final class SkyLightOperator {
         window.canBecomeVisibleWithoutLogin = true
         window.level = .init(rawValue: Int(Int32.max - 2))
 
-        _ = addFn(connection, space, [windowNumber] as CFArray, 7)
+        let status = addFn(connection, space, [windowNumber] as CFArray, 7)
+        if status != 0 {
+            window.level = .screenSaver
+            return false
+        }
         return true
     }
 }

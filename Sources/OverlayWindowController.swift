@@ -6,7 +6,6 @@ public final class OverlayWindowController: NSObject {
     
     private var window: NSWindow?
     private var metalView: MetalFoldView?
-    private var isCapturing = false
     private var wasZeroTurn = true
     private var sleepObservers: [NSObjectProtocol] = []
     private var displayReconfigObserver: NSObjectProtocol?
@@ -25,19 +24,18 @@ public final class OverlayWindowController: NSObject {
     // all modes (was: two factories + a flag that prevented nothing).
     private var foldTask: Task<Void, Never>?
 
-    // NSScreen.screens IPCs per call — cache, refresh on reconfiguration.
-    private var cachedScreenCount: Int = 1
-    // Suppression decision, cached: topology cannot change without a display
-    // reconfiguration or sleep/wake notification (both observed). Per-tick
-    // CGGetActiveDisplayList IPCs were the same sin the 1Hz clamshell cache
-    // fixed on the sensor side.
+    // NSScreen topology cannot change without a display reconfiguration or
+    // sleep/wake notification (all observed) — except the lid itself, which
+    // drives this very update(). So the cached decision refreshes on those
+    // events plus every show transition (once per fold, never per-tick).
     private var suppressForClamshell = false
 
-    /// Recompute suppression. Called on init, reconfiguration, sleep, wake —
-    /// never per-tick.
+    /// Recompute suppression. Called on init, reconfiguration, sleep, wake,
+    /// and on every show transition (cheap, runs once per fold — closes the
+    /// staleness window where a lid-close lands before any notification).
     private func refreshSuppression() {
-        cachedScreenCount = NSScreen.screens.count
-        suppressForClamshell = cachedScreenCount > 1 && Self.isBuiltInPanelAsleepOrGone() && Self.hasBuiltInPanelOnline()
+        let count = NSScreen.screens.count
+        suppressForClamshell = count > 1 && Self.isBuiltInPanelAsleepOrGone() && Self.hasBuiltInPanelOnline() && LidSensor.shared.isLidPhysicallyClosed
     }
     
     public override init() {
@@ -101,7 +99,6 @@ public final class OverlayWindowController: NSObject {
     }
     
     private func handleSleep() {
-        refreshSuppression()
         hideOverlay()
         AppSettings.shared.isScreenCaptureDormant = true
     }
@@ -140,12 +137,13 @@ public final class OverlayWindowController: NSObject {
         win.ignoresMouseEvents = true
         win.alphaValue = 0.0
 
-        // Structural self-exclusion: the overlay never appears in SCK or
-        // CGWindowList captures, permanently — no per-filter PID exclusion
-        // needed, no stale-exclusion race on show. ON-DEVICE VERIFICATION
-        // REQUIRED: show → capture → confirm no feedback frame; if SCK ever
-        // ignores sharingType, the PID-exclusion filters below are the
-        // fallback (kept, plus invalidate-on-reconfig).
+        // Best-effort self-exclusion: removes the window from legacy
+        // CGWindowList paths. It does NOT exclude SCK display captures on
+        // macOS 15.4+ (composited framebuffer is captured regardless — DTS:
+        // "no public APIs for preventing screen capture"), so the PID-
+        // exclusion filters below remain the load-bearing layer there, plus
+        // full cache invalidation on show. ON-DEVICE VERIFICATION: show →
+        // capture → confirm no feedback frame on each supported OS.
         win.sharingType = .none
         
         if AppSettings.shared.enableLockScreenPriority {
@@ -202,22 +200,45 @@ public final class OverlayWindowController: NSObject {
         if turn > 0.0005 {
             openFadeDeadline = 0
             if wasZeroTurn {
+                // The lid itself is a topology event no notification precedes:
+                // re-resolve suppression here (once per fold) before trusting
+                // the cached decision.
+                refreshSuppression()
+                if suppressForClamshell {
+                    AppSettings.shared.isScreenCaptureDormant = true
+                    return
+                }
+                // Cold-texture gate: never orderFront with no frame. If the
+                // launch fetch lost its race (or first run), fetch now and
+                // show on a later tick at the then-current turn — a late
+                // correct fold beats a teleport-from-nothing. Re-issues only
+                // when no fetch is in flight (no 120Hz fetch thrash).
+                guard mv.hasTexture else {
+                    if foldTask == nil {
+                        captureScreenAsync()
+                    }
+                    mv.isPaused = false
+                    return
+                }
                 wasZeroTurn = false
                 win.alphaValue = 1.0
-                // Filter-only refresh: rebuilding the exclusion list from the
-                // warm content cache is cheap (no WindowServer enumeration);
-                // sharingType=.none already excludes us structurally, and full
-                // invalidation on every show would re-pay enumeration latency
-                // on the critical path. Geometry staleness is handled on
-                // reconfiguration, not here.
-                ScreenCapture.shared.invalidateFilterCache()
+                // Full invalidation on show: SCK captures the composited
+                // framebuffer regardless of sharingType (15.4+), so a filter
+                // rebuilt from a pre-show window list photographs our own
+                // just-ordered overlay. Correctness beats the enumeration
+                // latency saved by filter-only refresh.
+                ScreenCapture.shared.invalidateCaches()
                 mv.resumeRendering()
                 win.orderFrontRegardless()
                 beginOverlayActivity()
                 if AppSettings.shared.enableLockScreenPriority {
                     SkyLightOperator.shared.delegateWindow(win)
                 }
-                // Non-live modes load through the same single factory.
+                // Live mode takes the warm stream frame or captures — one
+                // task factory. Frozen-at-show semantics: the frame is taken
+                // once here and never refreshed mid-fold, so a video playing
+                // underneath can't keep moving inside the fold, and 60Hz
+                // stream frames can't step against 120Hz geometry.
                 if AppSettings.shared.imageSourceMode == .liveCapture {
                     // Fast path first: a warm stream hands us an IOSurface
                     // frame with zero CPU copies. Cold stream → capture.
@@ -226,7 +247,7 @@ public final class OverlayWindowController: NSObject {
                        let frame = StreamCapture.shared.takeLatestTexture(device: dev) {
                         mv.updateStreamTexture(frame.texture, width: frame.width, height: frame.height, keeper: frame.keeper)
                     } else {
-                        captureScreenAsync(fullResolution: turn < 0.2)
+                        captureScreenAsync()
                     }
                 } else {
                     captureScreenAsync()
@@ -335,9 +356,12 @@ public final class OverlayWindowController: NSObject {
     /// entry point for the menu bar and settings panel. One cancellable task;
     /// texture-generation newest-wins arbitrates overlap. Dropping the newest
     /// behind an in-flight fetch once showed stale frames, so we never drop.
-    public func captureScreenAsync(fullResolution: Bool = false) {
+    /// Always half-res: the sharp LOD<=0.15 path almost never fires past
+    /// turn>0 (radius ramps immediately), so full-res buys nothing visible
+    /// while quadrupling bytes — and alternating full/cold with half/warm
+    /// shows ping-ponged sharpness across folds. Honest soft-start, always.
+    public func captureScreenAsync() {
         foldTask?.cancel()
-        isCapturing = true
         AppSettings.shared.isScreenCaptureDormant = false
 
         // Upload itself is ordered + cheap (background serial queue), so no
@@ -348,19 +372,13 @@ public final class OverlayWindowController: NSObject {
         // pattern is Sendable-clean (proven by typecheck, Swift 6 mode).
         foldTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let live = AppSettings.shared.imageSourceMode == .liveCapture
-            let image: CGImage?
-            if live {
-                image = await ScreenCapture.shared.fetchImage(scaleFactor: fullResolution ? 1.0 : 0.5)
-            } else {
-                image = await ScreenCapture.shared.fetchImage()
-            }
+            let image = await ScreenCapture.shared.fetchImage(scaleFactor: 0.5)
             if let image {
                 self.metalView?.updateImage(image)
                 AppSettings.shared.lastCaptureDate = Date()
             }
-            self.isCapturing = false
             AppSettings.shared.isScreenCaptureDormant = true
+            self.foldTask = nil
         }
     }
 }
