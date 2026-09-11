@@ -15,7 +15,9 @@ import Metal
 /// one-shot path. Any failure → caller falls back to SCScreenshotManager.
 ///
 /// Lifecycle: primed on lid pre-arm (stream is warm before the fold), kept
-/// across shows, stopped 5s after hide. Idle cost when parked: zero.
+/// across shows, stopped 1.5s after hide. Idle cost when parked: the stop
+/// timer plus a quiescent session — near-zero when static (.complete gate),
+/// hard zero after the tail.
 ///
 /// Synchronization: manually synchronized — all mutable state under `lock`
 /// except lifecycle flags confined to `outputQueue`. Declared Sendable on
@@ -68,7 +70,9 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
 
     /// Overlay hidden: stop the stream after a short idle tail. 1.5s covers
     /// hysteresis-band jiggle re-shows (sub-second); anything longer parks a
-    /// full session + timer for incidental hides. Disabled path stops now.
+    /// session for incidental hides. Disabled path stops now. Note: the tail
+    /// bounds OUR retention only — SCK delivers change-driven frames, so a
+    /// static desktop costs idle ticks, not encodes, until the stop lands.
     public func noteHidden() {
         guard Self.fastPathEnabled else {
             outputQueue.async { [weak self] in
@@ -160,7 +164,10 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
             config.width = max(2, Int(Double(display.width) * Double(scale) * 0.5))
             config.height = max(2, Int(Double(display.height) * Double(scale) * 0.5))
             config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-            config.queueDepth = 2
+            // Documented queue floor is 3; below risks start-rejection on
+            // stricter OS releases. Newest-only consumer + complete-gate mean
+            // the extra resident frame (~6-12MB half-res) buys compliance.
+            config.queueDepth = 3
             config.showsCursor = false
             config.capturesAudio = false
             config.pixelFormat = kCVPixelFormatType_32BGRA
@@ -255,7 +262,7 @@ extension StreamCapture: SCStreamOutput, SCStreamDelegate {
               CMSampleBufferDataIsReady(sampleBuffer),
               Self.frameIsComplete(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        // ARC retains the buffer; the previous frame releases here. No copy.
+        // No copy: the buffer is retained here, the previous frame released.
         lock.lock()
         latestPixelBuffer = pixelBuffer
         lock.unlock()
