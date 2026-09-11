@@ -10,19 +10,25 @@ public struct Uniforms {
     public var turn: Float
     public var blurStrength: Float
     public var reflectionIntensity: Float
+    public var sampleCount: Float
+    public var motionBoost: Float
     
     public init(imageSize: SIMD2<Float> = .init(1, 1),
                 cover: SIMD2<Float> = .init(1, 1),
                 aspect: Float = 1.0,
                 turn: Float = 0.0,
                 blurStrength: Float = 1.0,
-                reflectionIntensity: Float = 1.0) {
+                reflectionIntensity: Float = 1.0,
+                sampleCount: Float = 32.0,
+                motionBoost: Float = 0.0) {
         self.imageSize = imageSize
         self.cover = cover
         self.aspect = aspect
         self.turn = turn
         self.blurStrength = blurStrength
         self.reflectionIntensity = reflectionIntensity
+        self.sampleCount = sampleCount
+        self.motionBoost = motionBoost
     }
 }
 
@@ -37,6 +43,31 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
     public var currentTurn: Float = 0.0
     public var blurStrength: Float = 0.5
     public var reflectionIntensity: Float = 0.0
+
+    // MARK: - Adaptive quality (close path only)
+
+    /// 12 taps near open, 20 mid-fold, 32 on deep/fast close. Matches shader clamp.
+    static func adaptiveSampleCount(turn: Float) -> Float {
+        if turn < 0.20 { return 12.0 }
+        if turn < 0.60 { return 20.0 }
+        return 32.0
+    }
+
+    /// Velocity-aware boost in blur-radius units. Dead-zoned + clamped so HID
+    /// jitter at rest adds nothing and fast slams stay silky, never mushy.
+    static func velocityBlurBoost() -> Float {
+        let v = abs(LidSensor.shared.smoothedVelocity) // deg/sec
+        guard v > 30.0 else { return 0.0 }
+        return Float(min((v - 30.0) * 0.02, 12.0))
+    }
+
+    /// Drop to 60fps when effectively parked; 120fps only while folding.
+    func updateFrameRate(turn: Float) {
+        let target = turn > 0.02 ? 120 : 60
+        if preferredFramesPerSecond != target {
+            preferredFramesPerSecond = target
+        }
+    }
     
     public init(frame: CGRect) {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -201,6 +232,8 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
         let viewSize = view.drawableSize
         let aspect = Float(viewSize.width / max(1.0, viewSize.height))
         let imgAspect = imageSize.x / max(1.0, imageSize.y)
+
+        updateFrameRate(turn: currentTurn)
         
         let cover = SIMD2<Float>(
             min(1.0, aspect / imgAspect),
@@ -213,7 +246,9 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
             aspect: aspect,
             turn: currentTurn,
             blurStrength: blurStrength,
-            reflectionIntensity: reflectionIntensity
+            reflectionIntensity: reflectionIntensity,
+            sampleCount: Self.adaptiveSampleCount(turn: currentTurn),
+            motionBoost: Self.velocityBlurBoost()
         )
         
         encoder.setRenderPipelineState(pipeline)
