@@ -196,12 +196,19 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
 
     public var hasTexture: Bool { currentTexture != nil }
 
+    /// Provenance: true when the resident texture came from a live capture
+    /// or the warm stream, false for wallpaper/bundled/custom fills. The
+    /// show gate uses it so a first-run wallpaper frame can never pose as a
+    /// live desktop (it would pop mid-fold when live replaces it).
+    public var isLiveTexture = false
+
     /// Upload a capture to the GPU. Decode + staging + blit all run on the
     /// serial upload queue; only the finished-texture assignment hops to main.
     /// One command buffer, one queue: copy + mipgen are ordered by submission,
     /// published in addCompletedHandler. No waitUntilCompleted anywhere.
     /// draw() holds the texture for the frame, so swapping is safe.
-    public func updateImage(_ cgImage: CGImage) {
+    /// isLive records provenance for the show gate (see isLiveTexture).
+    public func updateImage(_ cgImage: CGImage, isLive: Bool = false) {
         guard let dev = self.device, let cq = self.commandQueue else { return }
 
         textureGeneration &+= 1
@@ -279,11 +286,13 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
             mips.endEncoding()
             // Publish on completion: assignment lands on main only for the
             // newest generation; older overlapping uploads are discarded.
+            // Provenance travels with the texture for the show gate.
             cb.addCompletedHandler { [weak self] _ in
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.textureGeneration == generation else { return }
                     self.imageSize = SIMD2<Float>(Float(width), Float(height))
                     self.currentTexture = texture
+                    self.isLiveTexture = isLive
                 }
             }
             cb.commit()
@@ -331,12 +340,14 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
             mips.endEncoding()
             // keeper captured through completion: the source mapping must
             // outlive the GPU work, not just the CPU-side encoding.
+            // Stream frames are always live captures (provenance = true).
             cb.addCompletedHandler { [weak self, keeper] _ in
                 _ = keeper
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.textureGeneration == generation else { return }
                     self.imageSize = SIMD2<Float>(Float(copyWidth), Float(copyHeight))
                     self.currentTexture = texture
+                    self.isLiveTexture = true
                 }
             }
             cb.commit()

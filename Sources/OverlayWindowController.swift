@@ -20,9 +20,11 @@ public final class OverlayWindowController: NSObject {
     private var overlayActivity: NSObjectProtocol?
 
     // Show-triggered reload task: cancellable so a hide mid-capture can't
-    // strand a texture publish into a hidden view. Single task factory for
-    // all modes (was: two factories + a flag that prevented nothing).
+    // strand a texture publish into a hidden view.
     private var foldTask: Task<Void, Never>?
+    // Task is a struct (no identity): the generation tells a stale
+    // completion not to nil a newer task's handle out from under it.
+    private var foldGeneration: UInt64 = 0
 
     // NSScreen topology cannot change without a display reconfiguration or
     // sleep/wake notification (all observed) — except the lid itself, which
@@ -208,12 +210,19 @@ public final class OverlayWindowController: NSObject {
                     AppSettings.shared.isScreenCaptureDormant = true
                     return
                 }
-                // Cold-texture gate: never orderFront with no frame. If the
-                // launch fetch lost its race (or first run), fetch now and
-                // show on a later tick at the then-current turn — a late
-                // correct fold beats a teleport-from-nothing. Re-issues only
-                // when no fetch is in flight (no 120Hz fetch thrash).
-                guard mv.hasTexture else {
+                // Cold-texture gate with provenance: never orderFront with no
+                // frame, and never with a NON-live frame in live mode (a
+                // first-run wallpaper posing as desktop would pop mid-fold
+                // when live replaces it). Without recording permission any
+                // frame passes — fallback art is the honest best available.
+                // If the launch fetch lost its race, fetch now and show on a
+                // later tick at the then-current turn — a late correct fold
+                // beats a teleport-from-nothing. Re-issues only when no fetch
+                // is in flight (no 120Hz fetch thrash).
+                let liveMode = AppSettings.shared.imageSourceMode == .liveCapture
+                let textureOK = mv.hasTexture
+                    && (!liveMode || mv.isLiveTexture || !AppSettings.shared.hasScreenRecordingPermission)
+                guard textureOK else {
                     if foldTask == nil {
                         captureScreenAsync()
                     }
@@ -356,10 +365,12 @@ public final class OverlayWindowController: NSObject {
     /// entry point for the menu bar and settings panel. One cancellable task;
     /// texture-generation newest-wins arbitrates overlap. Dropping the newest
     /// behind an in-flight fetch once showed stale frames, so we never drop.
-    /// Always half-res: the sharp LOD<=0.15 path almost never fires past
-    /// turn>0 (radius ramps immediately), so full-res buys nothing visible
-    /// while quadrupling bytes — and alternating full/cold with half/warm
-    /// shows ping-ponged sharpness across folds. Honest soft-start, always.
+    /// Resolution tiered by panel density (1x externals stay full-res).
+    /// Single texture-reload factory for all modes — and the manual-refresh
+    /// entry point for the menu bar and settings panel. One cancellable task;
+    /// texture-generation newest-wins arbitrates overlap. Dropping the newest
+    /// behind an in-flight fetch once showed stale frames, so we never drop.
+    /// Resolution tiered by panel density (1x externals stay full-res).
     public func captureScreenAsync() {
         foldTask?.cancel()
         AppSettings.shared.isScreenCaptureDormant = false
@@ -370,15 +381,36 @@ public final class OverlayWindowController: NSObject {
         // strided sampling could alias into stale frames. Always upload.
         // @MainActor-isolated: the awaits suspend without blocking, and the
         // pattern is Sendable-clean (proven by typecheck, Swift 6 mode).
+        // Identity-guarded teardown: a cancelled predecessor runs to
+        // completion (fetch isn't cancellation-aware) and must not orphan a
+        // newer task by nil-ing the shared handle out from under it. Task is
+        // a struct (no ===), so a generation counter arbitrates instead.
+        foldGeneration &+= 1
+        let generation = foldGeneration
         foldTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let image = await ScreenCapture.shared.fetchImage(scaleFactor: 0.5)
+            let live = AppSettings.shared.imageSourceMode == .liveCapture
+            let image: CGImage?
+            if live {
+                image = await ScreenCapture.shared.fetchImage(scaleFactor: self.captureScaleFactor)
+            } else {
+                image = await ScreenCapture.shared.fetchImage()
+            }
             if let image {
-                self.metalView?.updateImage(image)
+                self.metalView?.updateImage(image, isLive: live)
                 AppSettings.shared.lastCaptureDate = Date()
             }
+            if self.foldGeneration == generation {
+                self.foldTask = nil
+            }
             AppSettings.shared.isScreenCaptureDormant = true
-            self.foldTask = nil
         }
+    }
+
+    /// Capture resolution tier: full pixels on 1x panels (960x540-upscaled
+    /// would be a blurry mess side-by-side with the live desktop), half on
+    /// Retina where the blur/LOD chain resolves no more. Main-thread only.
+    private var captureScaleFactor: CGFloat {
+        (NSScreen.main?.backingScaleFactor ?? 2.0) <= 1.0 ? 1.0 : 0.5
     }
 }

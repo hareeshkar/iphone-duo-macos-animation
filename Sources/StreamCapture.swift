@@ -222,16 +222,25 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
             lock.unlock()
             return nil
         }
-        if cacheDevice !== device || textureCache == nil {
-            var cache: CVMetalTextureCache?
-            CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
-            textureCache = cache
-            cacheDevice = device
-        }
-        guard let cache = textureCache else {
+        let cached = textureCache
+        let cachedDev = cacheDevice
+        lock.unlock()
+        // Cache creation can block: build outside the lock so frame delivery
+        // (didOutputSampleBuffer publishes under the same lock) never stalls
+        // behind it. Double-checked publish keeps a single cache per device.
+        var cache = cached
+        if cachedDev == nil || cache == nil || cachedDev! !== device {
+            var fresh: CVMetalTextureCache?
+            CVMetalTextureCacheCreate(nil, nil, device, nil, &fresh)
+            lock.lock()
+            if cacheDevice == nil || textureCache == nil || cacheDevice! !== device {
+                textureCache = fresh
+                cacheDevice = device
+            }
+            cache = textureCache
             lock.unlock()
-            return nil
         }
+        guard let cache else { return nil }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         var cvTexture: CVMetalTexture?
