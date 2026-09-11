@@ -23,6 +23,7 @@ public final class LidSensor {
     private let hidQueue = DispatchQueue(label: "com.mactilt.hid", qos: .userInitiated)
     private let hidStateLock = NSLock()
     private var _latestRawAngle: Double = 120.0
+    private var _latestSampleTime: CFTimeInterval = 0
     private var _latestReadOK: Bool = false
     private var _readFailStreak: Int = 0
     private var hidTimer: DispatchSourceTimer?
@@ -32,20 +33,26 @@ public final class LidSensor {
     public private(set) var displayTurn: Double = 0.0
     public private(set) var targetTurn: Double = 0.0
     public private(set) var currentRawAngle: Double = 120.0
-    private var previousRawAngle: Double = 120.0
     private var isActivelyClosing: Bool = false
     private var hasPreArmedInThisMotion: Bool = false
     private var lastPreArmTime: CFTimeInterval = 0
-    private var stationaryFrames: Int = 0
 
     // Clamshell truthfulness: smoothed angular velocity (deg/sec, negative = closing).
-    // Exposed for velocity-aware blur on the close path. Smoothed to reject HID jitter.
+    // Derived from actual HID sample timestamps — immune to timer-phase aliasing.
     public private(set) var smoothedVelocity: Double = 0.0
+    private var prevTickAngle: Double = 120.0
+    private var prevConsumedAngle: Double = 120.0
+    private var prevConsumedSampleTime: CFTimeInterval = 0
+    private var stillSince: CFTimeInterval? = nil
 
     // Adaptive polling: Feature Reports must be polled (no Input Reports from LAS),
     // so vary the rate instead — 10Hz idle, 60Hz armed, 120Hz while closing.
     private var workspaceObservers: [NSObjectProtocol] = []
     private var currentPollInterval: Double = 1.0 / 60.0
+    // Epoch guards the slot against stale fires from a cancelled HID timer:
+    // cancel() never interrupts an in-flight handler, so the handler must
+    // prove it belongs to the current timer before publishing.
+    private var hidPollEpoch: UInt64 = 0
     
     // Clamshell mode animation state (MacBook Neo, M1, etc.)
     private var isSimulating: Bool = false
@@ -93,14 +100,21 @@ public final class LidSensor {
     
     public func handleWake() {
         if AppSettings.shared.isHardwareSensor {
-            // Quiesce sampling before re-enumerating devices (avoids racing
-            // setupManager's hidDevice reassignment from the HID queue).
+            // Quiesce sampling, then re-enumerate OFF-main: setupManager
+            // blocks on IOHIDManagerOpen + per-device probe GetReports.
             hidTimer?.cancel()
             hidTimer = nil
-            setupManager()
-            reopenHIDIfNeeded()
-            if timer != nil {
-                scheduleHIDTimer(interval: currentPollInterval)
+            let reschedule = (timer != nil)
+            let interval = currentPollInterval
+            hidQueue.async { [weak self] in
+                guard let self else { return }
+                self.setupManager()
+                self.reopenHIDIfNeeded()
+                if reschedule {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.scheduleHIDTimer(interval: interval)
+                    }
+                }
             }
         } else {
             // Clamshell mode: on wake / opening from sleep, animate unfold
@@ -115,6 +129,16 @@ public final class LidSensor {
         }
     }
     
+    /// Runs bodies on main without deadlocking when already there.
+    /// setupManager/probing may run on hidQueue (post-wake) or main (init).
+    private func onMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+
     private func setupManager() {
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, Self.noOptions)
         guard IOHIDManagerOpen(manager, Self.noOptions) == kIOReturnSuccess else {
@@ -188,11 +212,15 @@ public final class LidSensor {
         }
         
         if let dev = foundDevice {
+            hidStateLock.lock()
             self.hidDevice = dev
-            AppSettings.shared.isHardwareSensor = true
-            AppSettings.shared.isClamshellMode = false
-            AppSettings.shared.isSensorConnected = true
-            AppSettings.shared.sensorStatusMessage = "Hardware Lid Angle Sensor connected (PID: 0x\(String(format: "%04X", detectedPid)) - \(detectedProd))."
+            hidStateLock.unlock()
+            onMain {
+                AppSettings.shared.isHardwareSensor = true
+                AppSettings.shared.isClamshellMode = false
+                AppSettings.shared.isSensorConnected = true
+                AppSettings.shared.sensorStatusMessage = "Hardware Lid Angle Sensor connected (PID: 0x\(String(format: "%04X", detectedPid)) - \(detectedProd))."
+            }
         } else {
             // Hardware sensor not present on this machine (e.g. MacBook Neo, M1 Air, M1 Pro 13", iMac)
             activateClamshellMode(reason: "MacBook Neo / M1 without continuous LAS hardware")
@@ -200,12 +228,18 @@ public final class LidSensor {
     }
     
     private func activateClamshellMode(reason: String) {
+        hidStateLock.lock()
         self.hidDevice = nil
-        AppSettings.shared.isHardwareSensor = false
-        AppSettings.shared.isClamshellMode = true
-        AppSettings.shared.isSensorConnected = true
-        AppSettings.shared.sensorStatusMessage = "Clamshell Mode Active (MacBook Neo / M1 — Auto Sleep & Wake Animation Enabled)"
-        lastKnownClamshellClosed = isLidClosedViaIORegistry()
+        self.isDeviceOpen = false
+        hidStateLock.unlock()
+        let closed = isLidClosedViaIORegistry()
+        onMain {
+            AppSettings.shared.isHardwareSensor = false
+            AppSettings.shared.isClamshellMode = true
+            AppSettings.shared.isSensorConnected = true
+            AppSettings.shared.sensorStatusMessage = "Clamshell Mode Active (MacBook Neo / M1 — Auto Sleep & Wake Animation Enabled)"
+        }
+        lastKnownClamshellClosed = closed
     }
     
     private func isLidClosedViaIORegistry() -> Bool {
@@ -252,12 +286,20 @@ public final class LidSensor {
     
     public func start() {
         guard timer == nil else { return }
-        hidQueue.sync { [weak self] in
+        // stop() removes wake observers; re-add here (guard is idempotent).
+        setupWakeAndSleepObservers()
+        // Async open: never block the caller behind an in-flight GetReport.
+        hidQueue.async { [weak self] in
             guard let self else { return }
-            if let device = self.hidDevice, !self.isDeviceOpen {
-                if IOHIDDeviceOpen(device, Self.noOptions) == kIOReturnSuccess {
-                    self.isDeviceOpen = true
-                }
+            self.hidStateLock.lock()
+            let device = self.hidDevice
+            let opened = self.isDeviceOpen
+            self.hidStateLock.unlock()
+            if let device, !opened,
+               IOHIDDeviceOpen(device, Self.noOptions) == kIOReturnSuccess {
+                self.hidStateLock.lock()
+                self.isDeviceOpen = true
+                self.hidStateLock.unlock()
             }
         }
         scheduleHIDTimer(interval: currentPollInterval)
@@ -272,45 +314,55 @@ public final class LidSensor {
             self?.tick()
         }
         if let t = timer {
-            // Active closing needs delivery during menu-tracking/scroll (.common);
-            // idle parks on .default so tracking doesn't wake us. Tolerance lets
-            // the system coalesce idle fires with other timers (battery).
-            let closing = isActivelyClosing || displayTurn > 0.001
-            RunLoop.main.add(t, forMode: closing ? .common : .default)
-            t.tolerance = closing ? 0 : interval * 0.2
+            // Always .common: easing must not freeze while the user drags a
+            // menu or scrolls mid-close (a truthfulness break). Battery comes
+            // from tolerance, not the runloop mode — a fresh timer only ever
+            // lives in one mode set, and default+re-add cannot downgrade.
+            RunLoop.main.add(t, forMode: .common)
+            let active = isActivelyClosing || displayTurn > 0.001
+            t.tolerance = active ? 0 : interval * 0.2
         }
     }
 
     private func scheduleHIDTimer(interval: Double) {
         hidTimer?.cancel()
+        hidStateLock.lock()
+        hidPollEpoch &+= 1
+        let epoch = hidPollEpoch
+        hidStateLock.unlock()
         let t = DispatchSource.makeTimerSource(queue: hidQueue)
         let leeway: DispatchTimeInterval = isActivelyClosing
             ? .nanoseconds(0)
             : .milliseconds(max(1, Int(interval * 200.0)))
         t.schedule(deadline: .now() + interval, repeating: interval, leeway: leeway)
         t.setEventHandler { [weak self] in
-            self?.pollHIDOnce()
+            self?.pollHIDOnce(epoch: epoch)
         }
         t.resume()
         hidTimer = t
     }
 
     /// Blocking Feature Report read. ALWAYS on hidQueue, never main.
-    /// Writes the latest angle into the lock-guarded slot; tick() consumes.
-    private func pollHIDOnce() {
-        guard let device = hidDevice else { return }
+    /// Stale fires from a cancelled timer prove epoch before publishing.
+    private func pollHIDOnce(epoch: UInt64) {
         hidStateLock.lock()
+        let device = hidDevice
         let opened = isDeviceOpen
+        let current = hidPollEpoch
         hidStateLock.unlock()
-        guard opened else { return }
+        guard opened, let device, epoch == current else { return }
 
         var report = [UInt8](repeating: 0, count: 8)
         var length = CFIndex(report.count)
         let result = IOHIDDeviceGetReport(device, kIOHIDReportTypeFeature, 1, &report, &length)
         hidStateLock.lock()
+        defer { hidStateLock.unlock() }
+        // Re-check epoch: a re-arm may have landed while we blocked.
+        guard epoch == hidPollEpoch else { return }
         if result == kIOReturnSuccess, length >= 3 {
             let rawValue = UInt16(report[2]) << 8 | UInt16(report[1])
             _latestRawAngle = Double(rawValue)
+            _latestSampleTime = CACurrentMediaTime()
             _latestReadOK = true
             _readFailStreak = 0
         } else {
@@ -319,18 +371,17 @@ public final class LidSensor {
                 _latestReadOK = false
             }
         }
-        hidStateLock.unlock()
     }
 
     private func reopenHIDIfNeeded() {
         hidQueue.async { [weak self] in
             guard let self else { return }
             self.hidStateLock.lock()
-            let needsReopen = !self.isDeviceOpen || !self._latestReadOK
             let device = self.hidDevice
+            let opened = self.isDeviceOpen
             self.hidStateLock.unlock()
-            guard needsReopen, let dev = device else { return }
-            if self.isDeviceOpen {
+            guard let dev = device else { return }
+            if opened {
                 IOHIDDeviceClose(dev, Self.noOptions)
             }
             let ok = IOHIDDeviceOpen(dev, Self.noOptions) == kIOReturnSuccess
@@ -339,6 +390,19 @@ public final class LidSensor {
             if ok { self._readFailStreak = 0 }
             self.hidStateLock.unlock()
         }
+    }
+
+    /// Close onset must not wait for the 2-tick stability gate: a close
+    /// starting from 10Hz idle would otherwise lag ~200ms — the exact hitch
+    /// users feel. Opening/downward motion kicks 120Hz immediately.
+    private func kickHighRateIfNeeded() {
+        let fast = 1.0 / 120.0
+        guard abs(currentPollInterval - fast) > 0.0001 else { return }
+        currentPollInterval = fast
+        stableDesiredInterval = fast
+        stableIntervalTicks = 0
+        scheduleHIDTimer(interval: fast)
+        scheduleEaseTimer(interval: fast)
     }
 
     /// Adaptive rate control — called at the end of tick(). Keeps zero-idle-cost
@@ -375,11 +439,18 @@ public final class LidSensor {
         hidTimer?.cancel()
         hidTimer = nil
         removeWakeAndSleepObservers()
-        hidQueue.sync { [weak self] in
+        // Async close: never block the caller behind an in-flight GetReport.
+        hidQueue.async { [weak self] in
             guard let self else { return }
-            if self.isDeviceOpen, let device = self.hidDevice {
+            self.hidStateLock.lock()
+            let device = self.hidDevice
+            let opened = self.isDeviceOpen
+            self.hidStateLock.unlock()
+            if opened, let device {
                 IOHIDDeviceClose(device, Self.noOptions)
+                self.hidStateLock.lock()
                 self.isDeviceOpen = false
+                self.hidStateLock.unlock()
             }
         }
     }
@@ -392,6 +463,7 @@ public final class LidSensor {
             // blocks on the kernel here — worst case we reuse last tick's value.
             hidStateLock.lock()
             let angle = _latestRawAngle
+            let sampleTime = _latestSampleTime
             let readOK = _latestReadOK
             hidStateLock.unlock()
 
@@ -401,30 +473,44 @@ public final class LidSensor {
             }
 
             if readOK {
+                let nowTick = CACurrentMediaTime()
                 // Track direction of movement and velocity
-                let delta = angle - previousRawAngle
+                let delta = angle - prevTickAngle
                 let isMovingDownward = delta < -0.4
                 let isMovingUpward = delta > 0.6
 
-                // Smoothed angular velocity (deg/sec) for velocity-aware blur.
-                // Clamped to reject HID spikes; decays to zero when stationary.
-                let instVelocity = delta / max(currentPollInterval, 1.0 / 240.0)
-                let clampedInst = min(max(instVelocity, -1200.0), 1200.0)
-                smoothedVelocity += (clampedInst - smoothedVelocity) * 0.25
-                if !isMovingDownward && !isMovingUpward {
+                // Velocity from ACTUAL sample timestamps, not the poll interval:
+                // the HID and ease timers share a rate but not a phase, so one
+                // tick may consume 0..2 fresh samples. New sample → honest
+                // dt-normalized velocity; stale sample → decay, never zero-spike.
+                if sampleTime > prevConsumedSampleTime {
+                    if prevConsumedSampleTime > 0 {
+                        let dtSample = max(sampleTime - prevConsumedSampleTime, 1.0 / 240.0)
+                        let instVelocity = (angle - prevConsumedAngle) / dtSample
+                        let clampedInst = min(max(instVelocity, -1200.0), 1200.0)
+                        smoothedVelocity += (clampedInst - smoothedVelocity) * 0.25
+                    }
+                    prevConsumedAngle = angle
+                    prevConsumedSampleTime = sampleTime
+                } else {
                     smoothedVelocity *= 0.85
                 }
+                prevTickAngle = angle
 
                 if isMovingDownward {
                     isActivelyClosing = true
-                    stationaryFrames = 0
+                    stillSince = nil
+                    kickHighRateIfNeeded()
                 } else if isMovingUpward {
                     isActivelyClosing = false
                     hasPreArmedInThisMotion = false
-                    stationaryFrames = 0
+                    stillSince = nil
                 } else {
-                    stationaryFrames += 1
-                    if stationaryFrames > 12 { // ~200ms of no downward movement
+                    // Time-based stillness (200ms), not frame-counted: the
+                    // adaptive clock runs 10..120Hz, so frame counts lie.
+                    if stillSince == nil {
+                        stillSince = nowTick
+                    } else if nowTick - stillSince! > 0.2 {
                         isActivelyClosing = false
                     }
                 }
@@ -447,7 +533,6 @@ public final class LidSensor {
                     }
                 }
 
-                previousRawAngle = angle
                 currentRawAngle = angle
                 settings.currentLidAngle = angle
                 settings.isClosing = isActivelyClosing
