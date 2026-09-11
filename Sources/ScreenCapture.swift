@@ -5,7 +5,14 @@ import ScreenCaptureKit
 
 public final class ScreenCapture {
     public static let shared = ScreenCapture()
-    
+
+    // P0-3: WindowServer enumeration (SCShareableContent) IPCs + walks every
+    // window — up to seconds with many windows. Cache content + filter with a
+    // short TTL; force-refresh on miss. Never on the fold critical path twice.
+    private var cachedContent: (content: SCShareableContent, date: Date)?
+    private var cachedFilter: (filter: SCContentFilter, displayID: CGDirectDisplayID, date: Date)?
+    private static let contentCacheTTL: TimeInterval = 5.0
+
     private init() {}
     
     /// Fast synchronous preflight
@@ -81,7 +88,10 @@ public final class ScreenCapture {
         
         switch settings.imageSourceMode {
         case .liveCapture:
-            if await verifyPermissionAsync(), let img = await captureLiveScreen() {
+            // Hot path: fast synchronous preflight only. The full async probe
+            // (enumeration + test capture) runs on didBecomeActive via
+            // AppSettings.refreshPermissions — never per fold frame.
+            if hasPermission(), let img = await captureLiveScreen() {
                 return img
             }
             // Fallback if permission not granted or capture failed
@@ -103,35 +113,62 @@ public final class ScreenCapture {
         }
     }
     
-    /// Live display capture using ScreenCaptureKit
+    /// Live display capture using ScreenCaptureKit.
+    /// One-shot SCScreenshotManager (never a streaming SCStream): no stream
+    /// setup/teardown, no queueDepth memory. Half-resolution — the fold blur
+    /// hides detail, and it quarters SCK + upload + shader cost.
     public func captureLiveScreen() async -> CGImage? {
         do {
-            let content: SCShareableContent
-            if #available(macOS 14.4, *) {
-                content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            } else {
-                content = try await SCShareableContent.current
-            }
+            let content = try await freshShareableContent()
             guard let display = content.displays.first else { return nil }
-            
-            // Exclude our own app's windows
-            let currentAppPID = NSRunningApplication.current.processIdentifier
-            let excludedWindows = content.windows.filter { $0.owningApplication?.processID == currentAppPID }
-            
-            let scale = NSScreen.main?.backingScaleFactor ?? 2.0
-            let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
+
+            let filter = cachedDisplayFilter(for: display, in: content)
             let config = SCStreamConfiguration()
-            config.width = Int(Double(display.width) * scale)
-            config.height = Int(Double(display.height) * scale)
-            config.showsCursor = true
+            // Half of native pixels: fold is heavily blurred by turn>0.2.
+            let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+            config.width = max(2, Int(Double(display.width) * Double(scale) * 0.5))
+            config.height = max(2, Int(Double(display.height) * Double(scale) * 0.5))
+            config.showsCursor = false
             config.pixelFormat = kCVPixelFormatType_32BGRA
             config.colorSpaceName = CGColorSpace.sRGB
-            
+
             return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         } catch {
             print("[ScreenCapture] ScreenCaptureKit error: \(error)")
+            // Stale cache (display reconfigured) — drop it so next call re-enumerates.
+            cachedContent = nil
+            cachedFilter = nil
             return nil
         }
+    }
+
+    private func freshShareableContent() async throws -> SCShareableContent {
+        if let cached = cachedContent,
+           Date().timeIntervalSince(cached.date) < Self.contentCacheTTL {
+            return cached.content
+        }
+        let content: SCShareableContent
+        if #available(macOS 14.4, *) {
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        } else {
+            content = try await SCShareableContent.current
+        }
+        cachedContent = (content, Date())
+        return content
+    }
+
+    private func cachedDisplayFilter(for display: SCDisplay, in content: SCShareableContent) -> SCContentFilter {
+        if let cached = cachedFilter,
+           cached.displayID == display.displayID,
+           Date().timeIntervalSince(cached.date) < Self.contentCacheTTL {
+            return cached.filter
+        }
+        // Exclude our own app's windows so the overlay never captures itself.
+        let currentAppPID = NSRunningApplication.current.processIdentifier
+        let excludedWindows = content.windows.filter { $0.owningApplication?.processID == currentAppPID }
+        let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
+        cachedFilter = (filter, display.displayID, Date())
+        return filter
     }
     
     /// Get user's current desktop wallpaper

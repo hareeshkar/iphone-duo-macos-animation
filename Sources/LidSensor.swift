@@ -15,9 +15,17 @@ public final class LidSensor {
     private var hidDevice: IOHIDDevice?
     private var isDeviceOpen = false
     private var timer: Timer?
-    
-    private var hidReport = [UInt8](repeating: 0, count: 8)
     private static let noOptions = IOOptionBits(kIOHIDOptionsTypeNone)
+
+    // P0-1: HID I/O lives on its own queue. IOHIDDeviceGetReport blocks on a
+    // kernel/SPU round-trip, so it must never run on the main runloop.
+    // Main thread keeps easing/interpolation/consumption only.
+    private let hidQueue = DispatchQueue(label: "com.mactilt.hid", qos: .userInitiated)
+    private let hidStateLock = NSLock()
+    private var _latestRawAngle: Double = 120.0
+    private var _latestReadOK: Bool = false
+    private var _readFailStreak: Int = 0
+    private var hidTimer: DispatchSourceTimer?
     
     // Physics and motion tracking
     private var lastTime: CFTimeInterval?
@@ -85,15 +93,14 @@ public final class LidSensor {
     
     public func handleWake() {
         if AppSettings.shared.isHardwareSensor {
-            if isDeviceOpen, let device = hidDevice {
-                IOHIDDeviceClose(device, Self.noOptions)
-                isDeviceOpen = false
-            }
+            // Quiesce sampling before re-enumerating devices (avoids racing
+            // setupManager's hidDevice reassignment from the HID queue).
+            hidTimer?.cancel()
+            hidTimer = nil
             setupManager()
-            if let device = hidDevice {
-                if IOHIDDeviceOpen(device, Self.noOptions) == kIOReturnSuccess {
-                    isDeviceOpen = true
-                }
+            reopenHIDIfNeeded()
+            if timer != nil {
+                scheduleHIDTimer(interval: currentPollInterval)
             }
         } else {
             // Clamshell mode: on wake / opening from sleep, animate unfold
@@ -245,29 +252,100 @@ public final class LidSensor {
     
     public func start() {
         guard timer == nil else { return }
-        
-        if let device = hidDevice, !isDeviceOpen {
-            if IOHIDDeviceOpen(device, Self.noOptions) == kIOReturnSuccess {
-                isDeviceOpen = true
+        hidQueue.sync { [weak self] in
+            guard let self else { return }
+            if let device = self.hidDevice, !self.isDeviceOpen {
+                if IOHIDDeviceOpen(device, Self.noOptions) == kIOReturnSuccess {
+                    self.isDeviceOpen = true
+                }
             }
         }
-        
-        schedulePollTimer(interval: currentPollInterval)
+        scheduleHIDTimer(interval: currentPollInterval)
+        scheduleEaseTimer(interval: currentPollInterval)
     }
 
-    private func schedulePollTimer(interval: Double) {
+    // MARK: - Dual timers: HID sampling (background) + easing (main)
+
+    private func scheduleEaseTimer(interval: Double) {
         timer?.invalidate()
-        currentPollInterval = interval
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.tick()
         }
         if let t = timer {
-            RunLoop.main.add(t, forMode: .common)
+            // Active closing needs delivery during menu-tracking/scroll (.common);
+            // idle parks on .default so tracking doesn't wake us. Tolerance lets
+            // the system coalesce idle fires with other timers (battery).
+            let closing = isActivelyClosing || displayTurn > 0.001
+            RunLoop.main.add(t, forMode: closing ? .common : .default)
+            t.tolerance = closing ? 0 : interval * 0.2
+        }
+    }
+
+    private func scheduleHIDTimer(interval: Double) {
+        hidTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: hidQueue)
+        let leeway: DispatchTimeInterval = isActivelyClosing
+            ? .nanoseconds(0)
+            : .milliseconds(max(1, Int(interval * 200.0)))
+        t.schedule(deadline: .now() + interval, repeating: interval, leeway: leeway)
+        t.setEventHandler { [weak self] in
+            self?.pollHIDOnce()
+        }
+        t.resume()
+        hidTimer = t
+    }
+
+    /// Blocking Feature Report read. ALWAYS on hidQueue, never main.
+    /// Writes the latest angle into the lock-guarded slot; tick() consumes.
+    private func pollHIDOnce() {
+        guard let device = hidDevice else { return }
+        hidStateLock.lock()
+        let opened = isDeviceOpen
+        hidStateLock.unlock()
+        guard opened else { return }
+
+        var report = [UInt8](repeating: 0, count: 8)
+        var length = CFIndex(report.count)
+        let result = IOHIDDeviceGetReport(device, kIOHIDReportTypeFeature, 1, &report, &length)
+        hidStateLock.lock()
+        if result == kIOReturnSuccess, length >= 3 {
+            let rawValue = UInt16(report[2]) << 8 | UInt16(report[1])
+            _latestRawAngle = Double(rawValue)
+            _latestReadOK = true
+            _readFailStreak = 0
+        } else {
+            _readFailStreak += 1
+            if _readFailStreak > 30 {
+                _latestReadOK = false
+            }
+        }
+        hidStateLock.unlock()
+    }
+
+    private func reopenHIDIfNeeded() {
+        hidQueue.async { [weak self] in
+            guard let self else { return }
+            self.hidStateLock.lock()
+            let needsReopen = !self.isDeviceOpen || !self._latestReadOK
+            let device = self.hidDevice
+            self.hidStateLock.unlock()
+            guard needsReopen, let dev = device else { return }
+            if self.isDeviceOpen {
+                IOHIDDeviceClose(dev, Self.noOptions)
+            }
+            let ok = IOHIDDeviceOpen(dev, Self.noOptions) == kIOReturnSuccess
+            self.hidStateLock.lock()
+            self.isDeviceOpen = ok
+            if ok { self._readFailStreak = 0 }
+            self.hidStateLock.unlock()
         }
     }
 
     /// Adaptive rate control — called at the end of tick(). Keeps zero-idle-cost
     /// promise: 10Hz when parked open, 60Hz when armed, 120Hz while closing.
+    /// Re-arms both timers only on stable transitions (no runloop churn).
+    private var stableDesiredInterval: Double = 1.0 / 60.0
+    private var stableIntervalTicks: Int = 0
     private func adaptPollInterval(angle: Double) {
         let settings = AppSettings.shared
         let desired: Double
@@ -278,18 +356,31 @@ public final class LidSensor {
         } else {
             desired = 1.0 / 10.0
         }
-        if abs(desired - currentPollInterval) > 0.0001 {
-            schedulePollTimer(interval: desired)
+        if abs(desired - stableDesiredInterval) > 0.0001 {
+            stableDesiredInterval = desired
+            stableIntervalTicks = 0
+        } else {
+            stableIntervalTicks += 1
+        }
+        if stableIntervalTicks == 2, abs(desired - currentPollInterval) > 0.0001 {
+            currentPollInterval = desired
+            scheduleHIDTimer(interval: desired)
+            scheduleEaseTimer(interval: desired)
         }
     }
     
     public func stop() {
         timer?.invalidate()
         timer = nil
+        hidTimer?.cancel()
+        hidTimer = nil
         removeWakeAndSleepObservers()
-        if isDeviceOpen, let device = hidDevice {
-            IOHIDDeviceClose(device, Self.noOptions)
-            isDeviceOpen = false
+        hidQueue.sync { [weak self] in
+            guard let self else { return }
+            if self.isDeviceOpen, let device = self.hidDevice {
+                IOHIDDeviceClose(device, Self.noOptions)
+                self.isDeviceOpen = false
+            }
         }
     }
     
@@ -297,77 +388,70 @@ public final class LidSensor {
         let settings = AppSettings.shared
         
         if settings.isHardwareSensor {
-            if isDeviceOpen, let device = hidDevice {
-                var length = CFIndex(hidReport.count)
-                let result = IOHIDDeviceGetReport(
-                    device,
-                    kIOHIDReportTypeFeature,
-                    1,
-                    &hidReport,
-                    &length
-                )
-                if result == kIOReturnSuccess, length >= 3 {
-                    let rawValue = UInt16(hidReport[2]) << 8 | UInt16(hidReport[1])
-                    let angle = Double(rawValue)
-                    
-                    // Track direction of movement and velocity
-                    let delta = angle - previousRawAngle
-                    let isMovingDownward = delta < -0.4
-                    let isMovingUpward = delta > 0.6
+            // Consume the latest angle sampled on hidQueue. Main thread never
+            // blocks on the kernel here — worst case we reuse last tick's value.
+            hidStateLock.lock()
+            let angle = _latestRawAngle
+            let readOK = _latestReadOK
+            hidStateLock.unlock()
 
-                    // Smoothed angular velocity (deg/sec) for velocity-aware blur.
-                    // Clamped to reject HID spikes; decays to zero when stationary.
-                    let instVelocity = delta / max(currentPollInterval, 1.0 / 240.0)
-                    let clampedInst = min(max(instVelocity, -1200.0), 1200.0)
-                    smoothedVelocity += (clampedInst - smoothedVelocity) * 0.25
-                    if !isMovingDownward && !isMovingUpward {
-                        smoothedVelocity *= 0.85
-                    }
-                    
-                    if isMovingDownward {
-                        isActivelyClosing = true
-                        stationaryFrames = 0
-                    } else if isMovingUpward {
-                        isActivelyClosing = false
-                        hasPreArmedInThisMotion = false
-                        stationaryFrames = 0
-                    } else {
-                        stationaryFrames += 1
-                        if stationaryFrames > 12 { // ~200ms of no downward movement
-                            isActivelyClosing = false
-                        }
-                    }
-                    
-                    // If lid is safely open, reset pre-arm latch and mark capture engine dormant
-                    if angle >= settings.startTiltAngle || (!isActivelyClosing && angle >= settings.startTiltAngle - 10.0) {
-                        hasPreArmedInThisMotion = false
-                        settings.isScreenCaptureDormant = true
-                    }
-                    
-                    // Hardware Pre-Arming Capture Zone:
-                    let nowTime = CACurrentMediaTime()
-                    let preArmThreshold = min(135.0, settings.startTiltAngle + 15.0)
-                    if angle <= preArmThreshold && angle < settings.startTiltAngle {
-                        if !hasPreArmedInThisMotion && (nowTime - lastPreArmTime > 2.0) {
-                            hasPreArmedInThisMotion = true
-                            lastPreArmTime = nowTime
-                            settings.isScreenCaptureDormant = false
-                            onPreArmCapture?()
-                        }
-                    }
-                    
-                    previousRawAngle = angle
-                    currentRawAngle = angle
-                    settings.currentLidAngle = angle
-                    settings.isClosing = isActivelyClosing
-                    settings.isSensorConnected = true
+            if !readOK {
+                // Sensor silent (sleep/wake gap) — try to re-establish off-main.
+                reopenHIDIfNeeded()
+            }
+
+            if readOK {
+                // Track direction of movement and velocity
+                let delta = angle - previousRawAngle
+                let isMovingDownward = delta < -0.4
+                let isMovingUpward = delta > 0.6
+
+                // Smoothed angular velocity (deg/sec) for velocity-aware blur.
+                // Clamped to reject HID spikes; decays to zero when stationary.
+                let instVelocity = delta / max(currentPollInterval, 1.0 / 240.0)
+                let clampedInst = min(max(instVelocity, -1200.0), 1200.0)
+                smoothedVelocity += (clampedInst - smoothedVelocity) * 0.25
+                if !isMovingDownward && !isMovingUpward {
+                    smoothedVelocity *= 0.85
+                }
+
+                if isMovingDownward {
+                    isActivelyClosing = true
+                    stationaryFrames = 0
+                } else if isMovingUpward {
+                    isActivelyClosing = false
+                    hasPreArmedInThisMotion = false
+                    stationaryFrames = 0
                 } else {
-                    // Device connection may have dropped or suspended during deep sleep
-                    isDeviceOpen = false
-                    if IOHIDDeviceOpen(device, Self.noOptions) == kIOReturnSuccess {
-                        isDeviceOpen = true
+                    stationaryFrames += 1
+                    if stationaryFrames > 12 { // ~200ms of no downward movement
+                        isActivelyClosing = false
                     }
                 }
+
+                // If lid is safely open, reset pre-arm latch and mark capture engine dormant
+                if angle >= settings.startTiltAngle || (!isActivelyClosing && angle >= settings.startTiltAngle - 10.0) {
+                    hasPreArmedInThisMotion = false
+                    settings.isScreenCaptureDormant = true
+                }
+
+                // Hardware Pre-Arming Capture Zone (widened: capture is cheap now)
+                let nowTime = CACurrentMediaTime()
+                let preArmThreshold = min(140.0, settings.startTiltAngle + 25.0)
+                if angle <= preArmThreshold && angle < settings.startTiltAngle {
+                    if !hasPreArmedInThisMotion && (nowTime - lastPreArmTime > 2.0) {
+                        hasPreArmedInThisMotion = true
+                        lastPreArmTime = nowTime
+                        settings.isScreenCaptureDormant = false
+                        onPreArmCapture?()
+                    }
+                }
+
+                previousRawAngle = angle
+                currentRawAngle = angle
+                settings.currentLidAngle = angle
+                settings.isClosing = isActivelyClosing
+                settings.isSensorConnected = true
             }
             
             // Compute target turn: continuously mirrors physical angle across full range

@@ -62,11 +62,27 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
     }
 
     /// Drop to 60fps when effectively parked; 120fps only while folding.
+    /// Never called from draw() — mutating preferredFramesPerSecond mid-frame
+    /// tears down the display link and causes pacing jitter. Call from update().
     func updateFrameRate(turn: Float) {
         let target = turn > 0.02 ? 120 : 60
         if preferredFramesPerSecond != target {
             preferredFramesPerSecond = target
         }
+    }
+
+    /// Resume the display link for active folding. Called on show.
+    func resumeRendering() {
+        if isPaused {
+            isPaused = false
+        }
+    }
+
+    /// Full suspend: 0fps floor. Releases triple-buffered Retina drawables
+    /// (~90MB) so a hidden overlay costs WindowServer nothing. Called on hide.
+    func suspendRendering() {
+        isPaused = true
+        releaseDrawables()
     }
     
     public init(frame: CGRect) {
@@ -92,10 +108,12 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
         self.delegate = self
         self.colorPixelFormat = .bgra8Unorm
         self.clearColor = MTLClearColor(red: 0.003, green: 0.004, blue: 0.005, alpha: 1.0)
-        self.framebufferOnly = false
+        // Drawable is render-target-only (never sampled) — lets CAMetalLayer
+        // use the TBDR-optimized path. Parked state is fully suspended (0fps).
+        self.framebufferOnly = true
         self.enableSetNeedsDisplay = false
         self.preferredFramesPerSecond = 120
-        self.isPaused = false
+        self.isPaused = true
         
         // Sampler
         let samplerDesc = MTLSamplerDescriptor()
@@ -157,15 +175,46 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
         self.pipelineState = try? dev.makeRenderPipelineState(descriptor: pipeDesc)
     }
     
+    // Monotonic generation: drops stale uploads when captures overlap.
+    private var textureGeneration: UInt64 = 0
+
+    /// Upload a capture to the GPU. Heavy work (CG decode + draw + mip blit)
+    /// runs on a background queue; only the finished texture assignment hops
+    /// to main. draw() holds the texture for the frame, so swapping is safe.
     public func updateImage(_ cgImage: CGImage) {
-        guard let dev = self.device else { return }
-        
+        guard let dev = self.device, let cq = self.commandQueue else { return }
+
+        textureGeneration &+= 1
+        let generation = textureGeneration
         let width = cgImage.width
         let height = cgImage.height
-        imageSize = SIMD2<Float>(Float(width), Float(height))
-        
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            guard let texture = Self.makeFoldTexture(device: dev, cgImage: cgImage, width: width, height: height),
+                  let cb = cq.makeCommandBuffer(),
+                  let blit = cb.makeBlitCommandEncoder() else { return }
+            blit.generateMipmaps(for: texture)
+            blit.endEncoding()
+            // Publish on completion: assignment lands on main only for the
+            // newest generation; older overlapping uploads are discarded.
+            cb.addCompletedHandler { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.textureGeneration == generation else { return }
+                    self.imageSize = SIMD2<Float>(Float(width), Float(height))
+                    self.currentTexture = texture
+                }
+            }
+            cb.commit()
+        }
+    }
+
+    /// Decode + stage a fold texture. Background-safe: touches no view state.
+    /// Source texture is shader-read-only (never a render target), letting the
+    /// driver keep it out of tile memory on Apple Silicon TBDR GPUs.
+    private static func makeFoldTexture(device: MTLDevice, cgImage: CGImage, width: Int, height: Int) -> MTLTexture? {
         let levels = max(1, Int(floor(log2(Double(max(width, height))))))
-        
+
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm,
             width: width,
@@ -173,15 +222,28 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
             mipmapped: true
         )
         desc.mipmapLevelCount = levels
-        desc.usage = [.shaderRead, .renderTarget]
-        
-        guard let texture = dev.makeTexture(descriptor: desc) else { return }
-        
+        desc.usage = [.shaderRead]
+        desc.storageMode = .private
+
+        // Stage through a shared CPU-visible texture, then GPU-side blit into
+        // private storage — no synchronous replace() into renderable memory.
+        let stageDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        stageDesc.usage = [.shaderRead]
+        stageDesc.storageMode = .shared
+
+        guard let texture = device.makeTexture(descriptor: desc),
+              let staging = device.makeTexture(descriptor: stageDesc) else { return nil }
+
         // Render CGImage into level 0
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bytesPerRow = width * 4
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        
+
         guard let context = CGContext(
             data: nil,
             width: width,
@@ -190,28 +252,29 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
             bytesPerRow: bytesPerRow,
             space: colorSpace,
             bitmapInfo: bitmapInfo
-        ) else { return }
-        
+        ) else { return nil }
+
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-        if let data = context.data {
-            texture.replace(
-                region: MTLRegionMake2D(0, 0, width, height),
-                mipmapLevel: 0,
-                withBytes: data,
-                bytesPerRow: bytesPerRow
-            )
-        }
-        
-        // Generate mipmaps using blit command encoder
-        if let cq = self.commandQueue,
-           let cb = cq.makeCommandBuffer(),
-           let blit = cb.makeBlitCommandEncoder() {
-            blit.generateMipmaps(for: texture)
-            blit.endEncoding()
-            cb.commit()
-        }
-        
-        self.currentTexture = texture
+        guard let data = context.data else { return nil }
+        staging.replace(
+            region: MTLRegionMake2D(0, 0, width, height),
+            mipmapLevel: 0,
+            withBytes: data,
+            bytesPerRow: bytesPerRow
+        )
+
+        guard let cq = device.makeCommandQueue(),
+              let cb = cq.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: staging, sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: width, height: height, depth: 1),
+                  to: texture, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        return texture
     }
     
     // MARK: - MTKViewDelegate
@@ -232,8 +295,6 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
         let viewSize = view.drawableSize
         let aspect = Float(viewSize.width / max(1.0, viewSize.height))
         let imgAspect = imageSize.x / max(1.0, imageSize.y)
-
-        updateFrameRate(turn: currentTurn)
         
         let cover = SIMD2<Float>(
             min(1.0, aspect / imgAspect),

@@ -54,9 +54,7 @@ public final class OverlayWindowController: NSObject {
     }
     
     private func handleSleep() {
-        metalView?.isPaused = true
-        window?.alphaValue = 0.0
-        wasZeroTurn = true
+        hideOverlay()
         AppSettings.shared.isScreenCaptureDormant = true
     }
     
@@ -134,6 +132,7 @@ public final class OverlayWindowController: NSObject {
         mv.currentTurn = Float(turn)
         mv.blurStrength = Float(AppSettings.shared.blurStrength)
         mv.reflectionIntensity = Float(AppSettings.shared.reflectionIntensity)
+        mv.updateFrameRate(turn: Float(turn))
         
         // Only trigger when closing and turn > 0
         if turn > 0.0001 {
@@ -141,6 +140,7 @@ public final class OverlayWindowController: NSObject {
             if wasZeroTurn {
                 wasZeroTurn = false
                 win.alphaValue = 1.0
+                mv.resumeRendering()
                 win.orderFrontRegardless()
                 if AppSettings.shared.enableLockScreenPriority {
                     SkyLightOperator.shared.delegateWindow(win)
@@ -165,21 +165,26 @@ public final class OverlayWindowController: NSObject {
                     mv.currentTurn = 0.0
                     mv.isPaused = false
                 } else {
-                    openFadeFramesRemaining = 0
-                    wasZeroTurn = true
-                    win.alphaValue = 0.0
-                    mv.isPaused = true
+                    hideOverlay()
                 }
             }
         }
     }
     
     public func stopOverlay() {
+        hideOverlay()
+        metalView?.currentTurn = 0.0
+    }
+
+    /// Full hide: remove from the compositor scene graph and release GPU
+    /// drawables. alphaValue=0 alone keeps WindowServer compositing a
+    /// fullscreen transparent topmost window forever — battery tax.
+    private func hideOverlay() {
         wasZeroTurn = true
         openFadeFramesRemaining = 0
         window?.alphaValue = 0.0
-        metalView?.isPaused = true
-        metalView?.currentTurn = 0.0
+        window?.orderOut(nil)
+        metalView?.suspendRendering()
     }
     
     public func updateWindowLevel() {
