@@ -69,11 +69,13 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
         return Float(min((v - 30.0) * 0.02, 12.0))
     }
 
-    /// Resume the display link for active folding at full ProMotion cadence.
-    /// preferredFramesPerSecond is set once here — never mutated mid-frame,
-    /// and park (isPaused) handles the rest. Called on show.
+    /// Resume the display link for active folding. Cadence matches the panel:
+    /// 120fps on ProMotion internal, 60 on the 60Hz externals most desks use
+    /// (half the drawable acquisitions + fragment cost for frames the panel
+    /// never shows). Set once here — never mutated mid-frame. Called on show.
     func resumeRendering() {
-        preferredFramesPerSecond = 120
+        let panelMax = self.window?.screen?.maximumFramesPerSecond ?? 60
+        preferredFramesPerSecond = min(120, max(30, panelMax))
         if isPaused {
             isPaused = false
         }
@@ -289,7 +291,9 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
     /// straight into our private mipmapped texture. Skips CG decode, context
     /// draw, and staging entirely — the two full-frame CPU passes vanish.
     /// Same single-buffer, single-queue, generation-guarded ordering proof as
-    /// updateImage. keeper pins the source mapping until the blit completes.
+    /// updateImage. keeper is the CVMetalTexture container: retained through
+    /// GPU completion (not just the async block), because the MTLTexture is
+    /// an interior mapping that dies with its container.
     public func updateStreamTexture(_ source: MTLTexture, width: Int, height: Int, keeper: AnyObject) {
         guard let cq = self.commandQueue else { return }
         let copyWidth = min(width, source.width)
@@ -300,7 +304,6 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
 
         uploadQueue.async { [weak self, keeper] in
             guard let self else { return }
-            _ = keeper
             guard let dev = self.device else { return }
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .bgra8Unorm,
@@ -323,7 +326,10 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
             guard let mips = cb.makeBlitCommandEncoder() else { return }
             mips.generateMipmaps(for: texture)
             mips.endEncoding()
-            cb.addCompletedHandler { [weak self] _ in
+            // keeper captured through completion: the source mapping must
+            // outlive the GPU work, not just the CPU-side encoding.
+            cb.addCompletedHandler { [weak self, keeper] _ in
+                _ = keeper
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.textureGeneration == generation else { return }
                     self.imageSize = SIMD2<Float>(Float(copyWidth), Float(copyHeight))

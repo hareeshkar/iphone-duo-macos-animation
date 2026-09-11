@@ -27,6 +27,15 @@ public final class ScreenCapture {
         cachedContent = nil
         cachedFilter = nil
     }
+
+    /// Prefer the built-in panel in multi-display sets: mirror sets report
+    /// several displays and `first` is arbitrary. Falls back to first.
+    static func preferredDisplay(from content: SCShareableContent) -> SCDisplay? {
+        if let builtin = content.displays.first(where: { CGDisplayIsBuiltin($0.displayID) != 0 }) {
+            return builtin
+        }
+        return content.displays.first
+    }
     
     /// Fast synchronous preflight
     public func hasPermission() -> Bool {
@@ -135,7 +144,7 @@ public final class ScreenCapture {
     public func captureLiveScreen(scaleFactor: CGFloat = 0.5) async -> CGImage? {
         do {
             let content = try await freshShareableContent()
-            guard let display = content.displays.first else { return nil }
+            guard let display = Self.preferredDisplay(from: content) else { return nil }
 
             let filter = cachedDisplayFilter(for: display, in: content)
             let config = SCStreamConfiguration()
