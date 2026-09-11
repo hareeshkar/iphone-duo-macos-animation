@@ -44,8 +44,10 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
     public var blurStrength: Float = 0.5
     public var reflectionIntensity: Float = 0.0
     /// Velocity boost snapshot, written on main by OverlayWindowController.
-    /// draw() must never reach into LidSensor — the display link can run
-    /// off-main, and that would be an unsynchronized cross-thread read.
+    /// draw(in:) is @MainActor in practice (MTKView marshals there), so this
+    /// is main-confined rather than cross-thread — the snapshot still earns
+    /// its keep by decoupling sampling cadence from render cadence and by
+    /// keeping LidSensor reads out of frame encoding.
     public var motionBoost: Float = 0.0
 
     // MARK: - Adaptive quality (close path only)
@@ -81,12 +83,13 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
     /// orderOut (caller) removes the window from the compositor scene graph —
     /// those are the real wins. Note: releaseDrawables only frees the
     /// depth/multisample textures (we use neither), NOT the CAMetalLayer
-    /// drawable pool; dropping currentTexture is what actually returns the
-    /// ~15-30MB source texture. Called on hide, after any fade completes.
+    /// drawable pool. The last fold texture is deliberately KEPT across hide:
+    /// it is seconds old and is the covering first frame on next show, while
+    /// a fresh capture uploads async — nil-ing it traded a stale frame for a
+    /// black flash the async reload cannot cover in time.
     func suspendRendering() {
         isPaused = true
         releaseDrawables()
-        currentTexture = nil
     }
     
     public init(frame: CGRect) {

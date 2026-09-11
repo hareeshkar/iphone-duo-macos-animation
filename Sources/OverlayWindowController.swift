@@ -20,6 +20,10 @@ public final class OverlayWindowController: NSObject {
     // Scoped anti-nap: held only while the fold is visible, never at idle.
     private var overlayActivity: NSObjectProtocol?
 
+    // Show-triggered reload task: cancellable so a hide mid-capture can't
+    // strand a texture publish into a hidden view.
+    private var ensureTask: Task<Void, Never>?
+
     // NSScreen.screens IPCs per call — cache, refresh on reconfiguration.
     private var cachedScreenCount: Int = 1
     
@@ -147,9 +151,12 @@ public final class OverlayWindowController: NSObject {
         guard let win = self.window, let mv = self.metalView else { return }
 
         // Suppress only for genuine clamshell desktop mode: external attached
-        // AND the internal panel asleep. Mirrored presenting (panel awake)
-        // keeps the effect — the lid is still physically closing.
-        if cachedScreenCount > 1 && Self.isInternalDisplayAsleep() {
+        // AND the built-in panel asleep-or-gone. Mirrored presenting (panel
+        // awake) keeps the effect — the lid is still physically closing.
+        // NOTE: the primitive must be the BUILT-IN panel, not CGMainDisplayID:
+        // in clamshell the menu bar (and "main") migrates to the external,
+        // awake display, so a main-display sleep test is dead code there.
+        if cachedScreenCount > 1 && Self.isBuiltInPanelAsleepOrGone() {
             if !wasZeroTurn {
                 stopOverlay()
             }
@@ -170,20 +177,24 @@ public final class OverlayWindowController: NSObject {
             if wasZeroTurn {
                 wasZeroTurn = false
                 win.alphaValue = 1.0
-                // Fresh filter: windows created since the cache (including our
-                // own overlay) must be in the exclusion list, or the capture
-                // photographs our last frozen frame — feedback loop.
-                ScreenCapture.shared.invalidateFilterCache()
+                // Fresh content AND filter: content cached up to 5s may predate
+                // the just-ordered overlay, and the cached filter's exclusion
+                // list then can't exclude it — the capture would photograph
+                // our own frozen frame. Both caches drop on show.
+                ScreenCapture.shared.invalidateCaches()
                 mv.resumeRendering()
                 win.orderFrontRegardless()
                 beginOverlayActivity()
                 if AppSettings.shared.enableLockScreenPriority {
                     SkyLightOperator.shared.delegateWindow(win)
                 }
-                ensureTexture()
-                // If pre-arm hasn't finished or was skipped, trigger snapshot if not already active
+                // Non-live modes need their (instant) texture; live mode goes
+                // through the guarded capture path below — never both (double
+                // SCK enumeration + double capture per show).
                 if AppSettings.shared.imageSourceMode == .liveCapture {
                     captureScreenAsync(fullResolution: turn < 0.2)
+                } else {
+                    ensureTexture()
                 }
             }
             mv.isPaused = false
@@ -191,10 +202,13 @@ public final class OverlayWindowController: NSObject {
             if !wasZeroTurn {
                 // Safe open handoff: TIME-based fade (90ms) of the frozen frame
                 // over the live desktop. The real desktop is already there —
-                // no 3D unfold geometry to fight it.
+                // no 3D unfold geometry to fight it. Pin 60Hz through the fade:
+                // after stillness the ease clock may have decayed to 10Hz,
+                // which would quantize the fade into a single hard cut.
                 let now = CACurrentMediaTime()
                 if openFadeDeadline == 0 {
                     openFadeDeadline = now + Self.openFadeDuration
+                    LidSensor.shared.pinRate(1.0 / 60.0, for: Self.openFadeDuration + 0.05)
                 }
                 if now < openFadeDeadline {
                     let remaining = (openFadeDeadline - now) / Self.openFadeDuration
@@ -209,10 +223,21 @@ public final class OverlayWindowController: NSObject {
         // Between thresholds: hold last state (hysteresis band), no flapping.
     }
 
-    /// The internal panel is asleep while an external display drives the
-    /// desktop — the definition of clamshell mode worth suppressing for.
-    private static func isInternalDisplayAsleep() -> Bool {
-        CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    /// Built-in panel asleep-or-absent = genuine clamshell desktop mode.
+    /// Enumerates the ACTIVE display list for the built-in panel explicitly:
+    /// asleep sleeping displays stay in display space, and in clamshell the
+    /// internal panel is asleep (or removed) while the external is awake.
+    private static func isBuiltInPanelAsleepOrGone() -> Bool {
+        var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(16, &displays, &count) == .success else { return false }
+        for i in 0..<Int(count) {
+            if CGDisplayIsBuiltin(displays[i]) != 0 {
+                return CGDisplayIsAsleep(displays[i]) != 0
+            }
+        }
+        // No built-in panel in display space (closed clamshell) → suppress.
+        return true
     }
 
     private func beginOverlayActivity() {
@@ -224,17 +249,22 @@ public final class OverlayWindowController: NSObject {
         }
     }
 
-    /// suspendRendering nils the texture — reload it on show so the fold
-    /// never renders an empty frame.
+    /// Reload the fold texture when suspend dropped it. Folded into the
+    /// guarded capture path: concurrent show-triggered fetches share
+    /// isCapturing instead of racing two SCK enumerations per show.
+    /// Non-live modes only — live capture flows through captureScreenAsync.
     private func ensureTexture() {
-        guard let mv = metalView, !mv.hasTexture else { return }
+        guard let mv = metalView, !mv.hasTexture, !isCapturing else { return }
+        isCapturing = true
         // @MainActor-isolated task: no cross-actor self capture. The await
         // suspends (never blocks main); updateImage backgrounds decode/upload
         // onto the .utility upload queue internally.
-        Task { @MainActor [weak self] in
+        ensureTask?.cancel()
+        ensureTask = Task { @MainActor [weak self] in
             if let img = await ScreenCapture.shared.fetchImage() {
                 self?.metalView?.updateImage(img)
             }
+            self?.isCapturing = false
         }
     }
     
@@ -249,6 +279,8 @@ public final class OverlayWindowController: NSObject {
     private func hideOverlay() {
         wasZeroTurn = true
         openFadeDeadline = 0
+        ensureTask?.cancel()
+        ensureTask = nil
         window?.alphaValue = 0.0
         window?.orderOut(nil)
         metalView?.suspendRendering()
@@ -268,7 +300,10 @@ public final class OverlayWindowController: NSObject {
     }
     
     public func captureScreenAsync(fullResolution: Bool = false) {
-        guard !isCapturing else { return }
+        // No drop-newest guard: concurrent fetches are rare (show + pre-arm,
+        // throttled), uploads serialize on the upload queue, and the texture
+        // generation guard publishes newest-wins. Dropping the show-triggered
+        // capture while a pre-arm fetch was in flight showed stale frames.
         isCapturing = true
         AppSettings.shared.isScreenCaptureDormant = false
 
