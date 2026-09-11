@@ -139,7 +139,8 @@ public final class ScreenCapture {
 
             let filter = cachedDisplayFilter(for: display, in: content)
             let config = SCStreamConfiguration()
-            let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+            // NSScreen is main-thread-only; this runs on background tasks.
+            let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
             let targetW = max(2, Int(Double(display.width) * Double(scale) * Double(scaleFactor)))
             let targetH = max(2, Int(Double(display.height) * Double(scale) * Double(scaleFactor)))
             config.width = targetW

@@ -40,8 +40,10 @@ public final class OverlayWindowController: NSObject {
             self?.handleDisplayReconfiguration()
         }
 
-        // Connect intelligent hardware pre-arming
+        // Connect intelligent hardware pre-arming: warm the stream AND take a
+        // one-shot so the first show has a frame however it arrives.
         LidSensor.shared.onPreArmCapture = { [weak self] in
+            StreamCapture.shared.prime()
             self?.captureScreenAsync(fullResolution: true)
         }
     }
@@ -50,6 +52,7 @@ public final class OverlayWindowController: NSObject {
         cachedScreenCount = NSScreen.screens.count
         // Mode changes reuse displayIDs with new geometry — cached filters lie.
         ScreenCapture.shared.invalidateCaches()
+        StreamCapture.shared.restart()
         // Refit the overlay to the (possibly new) main screen geometry.
         if let win = window, let screen = NSScreen.main ?? NSScreen.screens.first {
             win.setFrame(screen.frame, display: false)
@@ -96,6 +99,8 @@ public final class OverlayWindowController: NSObject {
         if let win = self.window, AppSettings.shared.enableLockScreenPriority {
             SkyLightOperator.shared.delegateWindow(win)
         }
+        // Warm the stream for an imminent fold; refresh the parked texture.
+        StreamCapture.shared.prime()
         if AppSettings.shared.imageSourceMode == .liveCapture {
             captureScreenAsync()
         }
@@ -192,7 +197,15 @@ public final class OverlayWindowController: NSObject {
                 // through the guarded capture path below — never both (double
                 // SCK enumeration + double capture per show).
                 if AppSettings.shared.imageSourceMode == .liveCapture {
-                    captureScreenAsync(fullResolution: turn < 0.2)
+                    // Fast path first: a warm stream hands us an IOSurface
+                    // frame with zero CPU copies. Cold stream → one-shot.
+                    StreamCapture.shared.noteVisible()
+                    if let dev = mv.device,
+                       let frame = StreamCapture.shared.takeLatestTexture(device: dev) {
+                        mv.updateStreamTexture(frame.texture, width: frame.width, height: frame.height, keeper: frame.keeper)
+                    } else {
+                        captureScreenAsync(fullResolution: turn < 0.2)
+                    }
                 } else {
                     ensureTexture()
                 }
@@ -281,6 +294,7 @@ public final class OverlayWindowController: NSObject {
         openFadeDeadline = 0
         ensureTask?.cancel()
         ensureTask = nil
+        StreamCapture.shared.noteHidden()
         window?.alphaValue = 0.0
         window?.orderOut(nil)
         metalView?.suspendRendering()

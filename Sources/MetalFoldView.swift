@@ -209,8 +209,12 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
             // Shader samples LOD 0..1.85 only — 3 levels, not the full ~11.
             let levels = 3
 
+            // BGRA storage everywhere (not RGBA): the warm-stream path maps
+            // IOSurface frames that ARE BGRA, and blit copies require
+            // identical formats. Sampling is unaffected — the GPU swizzles to
+            // RGBA-ordered float4 on sample, so the shader is untouched.
             let desc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba8Unorm,
+                pixelFormat: .bgra8Unorm,
                 width: width,
                 height: height,
                 mipmapped: true
@@ -223,7 +227,7 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
             // into private storage — replace() runs on CPU, so it targets the
             // staging texture, never renderable memory.
             let stageDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba8Unorm,
+                pixelFormat: .bgra8Unorm,
                 width: width,
                 height: height,
                 mipmapped: false
@@ -236,7 +240,7 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
 
             let colorSpace = CGColorSpaceCreateDeviceRGB()
             let bytesPerRow = width * 4
-            let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+            let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
 
             guard let context = CGContext(
                 data: nil,
@@ -274,6 +278,55 @@ public final class MetalFoldView: MTKView, MTKViewDelegate {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.textureGeneration == generation else { return }
                     self.imageSize = SIMD2<Float>(Float(width), Float(height))
+                    self.currentTexture = texture
+                }
+            }
+            cb.commit()
+        }
+    }
+
+    /// Zero-copy fast path for warm-stream frames: blit the IOSurface texture
+    /// straight into our private mipmapped texture. Skips CG decode, context
+    /// draw, and staging entirely — the two full-frame CPU passes vanish.
+    /// Same single-buffer, single-queue, generation-guarded ordering proof as
+    /// updateImage. keeper pins the source mapping until the blit completes.
+    public func updateStreamTexture(_ source: MTLTexture, width: Int, height: Int, keeper: AnyObject) {
+        guard let cq = self.commandQueue else { return }
+        let copyWidth = min(width, source.width)
+        let copyHeight = min(height, source.height)
+        guard copyWidth > 0, copyHeight > 0 else { return }
+        textureGeneration &+= 1
+        let generation = textureGeneration
+
+        uploadQueue.async { [weak self, keeper] in
+            guard let self else { return }
+            _ = keeper
+            guard let dev = self.device else { return }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: copyWidth,
+                height: copyHeight,
+                mipmapped: true
+            )
+            desc.mipmapLevelCount = 3
+            desc.usage = [.shaderRead]
+            desc.storageMode = .private
+            guard let texture = dev.makeTexture(descriptor: desc),
+                  let cb = cq.makeCommandBuffer(),
+                  let copy = cb.makeBlitCommandEncoder() else { return }
+            copy.copy(from: source, sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: copyWidth, height: copyHeight, depth: 1),
+                      to: texture, destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            copy.endEncoding()
+            guard let mips = cb.makeBlitCommandEncoder() else { return }
+            mips.generateMipmaps(for: texture)
+            mips.endEncoding()
+            cb.addCompletedHandler { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.textureGeneration == generation else { return }
+                    self.imageSize = SIMD2<Float>(Float(copyWidth), Float(copyHeight))
                     self.currentTexture = texture
                 }
             }
