@@ -31,6 +31,10 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
     private var stream: SCStream?
     private var running = false
     private var starting = false
+    // Stream generation: stop/restart bump it so a warm-up that outlives its
+    // regime (reconfig mid-start, stop-then-start race, delayed error) can
+    // never publish or kill a successor.
+    private var streamGeneration: UInt64 = 0
     private var latestPixelBuffer: CVPixelBuffer?
     private var textureCache: CVMetalTextureCache?
     private var cacheDevice: MTLDevice?
@@ -62,9 +66,18 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Overlay hidden: stop the stream after 5s idle. WindowServer stops
-    /// compositing for us the moment nobody consumes.
+    /// Overlay hidden: stop the stream after a short idle tail. 1.5s covers
+    /// hysteresis-band jiggle re-shows (sub-second); anything longer parks a
+    /// full session + timer for incidental hides. Disabled path stops now.
     public func noteHidden() {
+        guard Self.fastPathEnabled else {
+            outputQueue.async { [weak self] in
+                self?.stopWorkItem?.cancel()
+                self?.stopWorkItem = nil
+                self?.stopStream()
+            }
+            return
+        }
         outputQueue.async { [weak self] in
             guard let self else { return }
             self.stopWorkItem?.cancel()
@@ -72,18 +85,22 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
                 self?.stopStream()
             }
             self.stopWorkItem = item
-            self.outputQueue.asyncAfter(deadline: .now() + 5.0, execute: item)
+            self.outputQueue.asyncAfter(deadline: .now() + 1.5, execute: item)
         }
     }
 
     /// Display set changed: the cached filter's geometry is stale. Tear down
-    /// now; the next prime/visible restarts against the new configuration.
+    /// now (bumping the generation so the in-flight warm-up can't publish);
+    /// the next prime/visible restarts against the new configuration.
     public func restart() {
-        guard Self.fastPathEnabled else { return }
         outputQueue.async { [weak self] in
             guard let self else { return }
             self.stopWorkItem?.cancel()
             self.stopWorkItem = nil
+            self.lock.lock()
+            self.streamGeneration &+= 1
+            self.starting = false
+            self.lock.unlock()
             self.stopStream()
         }
     }
@@ -92,20 +109,32 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
         guard !running && !starting else { return }
         guard ScreenCapture.shared.hasPermission() else { return }
         starting = true
+        lock.lock()
+        streamGeneration &+= 1
+        let generation = streamGeneration
+        lock.unlock()
         // Detached: startStream awaits with no locks held; completion hops
-        // back to outputQueue where all flag mutation is confined.
+        // back to outputQueue where all flag mutation is confined, and
+        // publishes only if its generation is still current.
         let queue = outputQueue
         Task.detached(priority: .utility) { [weak self] in
             let stream = await self?.startStream()
             queue.async { [weak self] in
-                self?.starting = false
+                guard let self else { return }
+                self.lock.lock()
+                let current = self.streamGeneration
+                self.lock.unlock()
+                guard generation == current else { return }
+                self.starting = false
                 if let stream {
-                    self?.lock.lock()
-                    self?.stream = stream
-                    self?.running = true
-                    self?.lock.unlock()
+                    self.lock.lock()
+                    self.stream = stream
+                    self.running = true
+                    self.lock.unlock()
                 } else {
-                    self?.running = false
+                    self.lock.lock()
+                    self.running = false
+                    self.lock.unlock()
                 }
             }
         }
@@ -117,23 +146,28 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
     private func startStream() async -> SCStream? {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let display = content.displays.first else { return nil }
+            guard let display = ScreenCapture.preferredDisplay(from: content) else { return nil }
             let pid = NSRunningApplication.current.processIdentifier
             let excluded = content.windows.filter { $0.owningApplication?.processID == pid }
             let filter = SCContentFilter(display: display, excludingWindows: excluded)
-            // Native pixels: the mapping is zero-copy, so full resolution
-            // costs no CPU — the shader downsamples naturally. Cursor stays
-            // out: a frozen cursor over a live desktop reads as a bug.
+            // Half of native pixels: the fold shader provably cannot resolve
+            // more (blur mix + LOD 1.85 cap over 3 mip levels), so full-res
+            // would quadruple resident + encode + blit bytes for zero pixels.
+            // Cursor stays out: a frozen cursor over live desktop reads as bug.
             // NSScreen is main-thread-only: resolve the scale on MainActor.
             let scale = await MainActor.run { NSScreen.main?.backingScaleFactor ?? 2.0 }
             let config = SCStreamConfiguration()
-            config.width = Int(Double(display.width) * Double(scale))
-            config.height = Int(Double(display.height) * Double(scale))
+            config.width = max(2, Int(Double(display.width) * Double(scale) * 0.5))
+            config.height = max(2, Int(Double(display.height) * Double(scale) * 0.5))
             config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
             config.queueDepth = 2
             config.showsCursor = false
             config.capturesAudio = false
             config.pixelFormat = kCVPixelFormatType_32BGRA
+            // Match the one-shot path's sRGB contract: two gamuts into one
+            // untagged bgra8Unorm drawable would pop saturation at fold start
+            // on wide-gamut panels. Neither path does HDR (correct for SDR).
+            config.colorSpaceName = CGColorSpace.sRGB
             let stream = SCStream(filter: filter, configuration: config, delegate: self)
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: outputQueue)
             try await stream.startCapture()
@@ -146,6 +180,7 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
     private func stopStream() {
         lock.lock()
         let stream = stream
+        streamGeneration &+= 1
         lock.unlock()
         guard let stream else { return }
         // stopCapture can stall for seconds (documented WindowServer
@@ -158,6 +193,11 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
         self.stream = nil
         running = false
         latestPixelBuffer = nil
+        // Release the pool the cache pins: retention without this grows
+        // across start/stop cycles instead of recycling.
+        if let cache = textureCache {
+            CVMetalTextureCacheFlush(cache, 0)
+        }
         lock.unlock()
     }
 
@@ -175,7 +215,7 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
             lock.unlock()
             return nil
         }
-        if cacheDevice == nil || textureCache == nil || !devicesEqual(cacheDevice, device) {
+        if cacheDevice !== device || textureCache == nil {
             var cache: CVMetalTextureCache?
             CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
             textureCache = cache
@@ -201,11 +241,6 @@ public final class StreamCapture: NSObject, @unchecked Sendable {
         lock.unlock()
         return (texture, width, height, cvTexture)
     }
-
-    private func devicesEqual(_ a: MTLDevice?, _ b: MTLDevice) -> Bool {
-        guard let a else { return false }
-        return a === b
-    }
 }
 
 // MARK: - SCStreamOutput + SCStreamDelegate
@@ -218,6 +253,7 @@ extension StreamCapture: SCStreamOutput, SCStreamDelegate {
     ) {
         guard type == .screen,
               CMSampleBufferDataIsReady(sampleBuffer),
+              Self.frameIsComplete(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         // ARC retains the buffer; the previous frame releases here. No copy.
         lock.lock()
@@ -225,10 +261,28 @@ extension StreamCapture: SCStreamOutput, SCStreamDelegate {
         lock.unlock()
     }
 
+    /// Only .complete frames refresh the latest texture. .idle ("display
+    /// didn't change" — the common parked-desktop case) would otherwise churn
+    /// IOSurface refcounts and defeat cache recycling for zero new pixels.
+    private static func frameIsComplete(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let statusRaw = attachments.first?[.status] as? Int,
+              let status = SCFrameStatus(rawValue: statusRaw) else {
+            return true
+        }
+        return status == .complete
+    }
+
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
         outputQueue.async { [weak self] in
             guard let self else { return }
             self.lock.lock()
+            // Identity check: a delayed error from a superseded stream must
+            // never kill its successor (restart/stop-start races).
+            guard let current = self.stream, current === stream else {
+                self.lock.unlock()
+                return
+            }
             self.running = false
             self.stream = nil
             self.latestPixelBuffer = nil
