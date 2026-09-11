@@ -8,6 +8,7 @@ public final class OverlayWindowController: NSObject {
     private var metalView: MetalFoldView?
     private var isCapturing = false
     private var wasZeroTurn = true
+    private var sleepObservers: [NSObjectProtocol] = []
     
     public override init() {
         super.init()
@@ -21,18 +22,26 @@ public final class OverlayWindowController: NSObject {
     }
     
     private func setupSleepObservers() {
+        guard sleepObservers.isEmpty else { return }
         let ws = NSWorkspace.shared.notificationCenter
-        ws.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
+        sleepObservers.append(ws.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleSleep()
-        }
-        ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+        })
+        sleepObservers.append(ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleSleep()
-        }
-        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+        })
+        sleepObservers.append(ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleWake()
-        }
-        ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+        })
+        sleepObservers.append(ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleWake()
+        })
+    }
+
+    deinit {
+        let ws = NSWorkspace.shared.notificationCenter
+        for token in sleepObservers {
+            ws.removeObserver(token)
         }
     }
     

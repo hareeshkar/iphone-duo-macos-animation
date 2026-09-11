@@ -29,6 +29,15 @@ public final class LidSensor {
     private var hasPreArmedInThisMotion: Bool = false
     private var lastPreArmTime: CFTimeInterval = 0
     private var stationaryFrames: Int = 0
+
+    // Clamshell truthfulness: smoothed angular velocity (deg/sec, negative = closing).
+    // Exposed for velocity-aware blur on the close path. Smoothed to reject HID jitter.
+    public private(set) var smoothedVelocity: Double = 0.0
+
+    // Adaptive polling: Feature Reports must be polled (no Input Reports from LAS),
+    // so vary the rate instead — 10Hz idle, 60Hz armed, 120Hz while closing.
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var currentPollInterval: Double = 1.0 / 60.0
     
     // Clamshell mode animation state (MacBook Neo, M1, etc.)
     private var isSimulating: Bool = false
@@ -50,19 +59,28 @@ public final class LidSensor {
     }
     
     private func setupWakeAndSleepObservers() {
+        guard workspaceObservers.isEmpty else { return }
         let ws = NSWorkspace.shared.notificationCenter
-        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+        workspaceObservers.append(ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleWake()
-        }
-        ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+        })
+        workspaceObservers.append(ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleWake()
-        }
-        ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+        })
+        workspaceObservers.append(ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleWillSleep()
-        }
-        ws.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
+        })
+        workspaceObservers.append(ws.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
             self?.handleWillSleep()
+        })
+    }
+
+    private func removeWakeAndSleepObservers() {
+        let ws = NSWorkspace.shared.notificationCenter
+        for token in workspaceObservers {
+            ws.removeObserver(token)
         }
+        workspaceObservers.removeAll()
     }
     
     public func handleWake() {
@@ -234,15 +252,41 @@ public final class LidSensor {
             }
         }
         
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        schedulePollTimer(interval: currentPollInterval)
+    }
+
+    private func schedulePollTimer(interval: Double) {
+        timer?.invalidate()
+        currentPollInterval = interval
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.tick()
         }
-        RunLoop.main.add(timer!, forMode: .common)
+        if let t = timer {
+            RunLoop.main.add(t, forMode: .common)
+        }
+    }
+
+    /// Adaptive rate control — called at the end of tick(). Keeps zero-idle-cost
+    /// promise: 10Hz when parked open, 60Hz when armed, 120Hz while closing.
+    private func adaptPollInterval(angle: Double) {
+        let settings = AppSettings.shared
+        let desired: Double
+        if isActivelyClosing {
+            desired = 1.0 / 120.0
+        } else if !settings.isScreenCaptureDormant || angle <= min(135.0, settings.startTiltAngle + 15.0) || displayTurn > 0.001 {
+            desired = 1.0 / 60.0
+        } else {
+            desired = 1.0 / 10.0
+        }
+        if abs(desired - currentPollInterval) > 0.0001 {
+            schedulePollTimer(interval: desired)
+        }
     }
     
     public func stop() {
         timer?.invalidate()
         timer = nil
+        removeWakeAndSleepObservers()
         if isDeviceOpen, let device = hidDevice {
             IOHIDDeviceClose(device, Self.noOptions)
             isDeviceOpen = false
@@ -270,6 +314,15 @@ public final class LidSensor {
                     let delta = angle - previousRawAngle
                     let isMovingDownward = delta < -0.4
                     let isMovingUpward = delta > 0.6
+
+                    // Smoothed angular velocity (deg/sec) for velocity-aware blur.
+                    // Clamped to reject HID spikes; decays to zero when stationary.
+                    let instVelocity = delta / max(currentPollInterval, 1.0 / 240.0)
+                    let clampedInst = min(max(instVelocity, -1200.0), 1200.0)
+                    smoothedVelocity += (clampedInst - smoothedVelocity) * 0.25
+                    if !isMovingDownward && !isMovingUpward {
+                        smoothedVelocity *= 0.85
+                    }
                     
                     if isMovingDownward {
                         isActivelyClosing = true
@@ -363,8 +416,7 @@ public final class LidSensor {
                     currentRawAngle = simulationTargetAngle
                     settings.currentLidAngle = currentRawAngle
                 }
-            } else if settings.isTestModeActive {
-                displayTurn = settings.normalizedTurn(for: 120.0)
+            } else if settings.isTestModeActive {                displayTurn = settings.normalizedTurn(for: 120.0)
                 currentRawAngle = 120.0 - displayTurn * 85.0
                 settings.currentLidAngle = currentRawAngle
             } else {
@@ -374,6 +426,7 @@ public final class LidSensor {
             }
         }
         
+        adaptPollInterval(angle: currentRawAngle)
         onTurnUpdate?(displayTurn, currentRawAngle)
     }
 }
