@@ -57,60 +57,64 @@ public final class LidSensor {
     private var prevConsumedSampleTime: CFTimeInterval = 0
     private var stillSince: CFTimeInterval? = nil
 
-    // α-β-γ predictor state (main-confined, tick context): masks the
-    // residual 30-80ms phase lag (HID poll + pipeline + capture age) so the
-    // fold leads the finger instead of trailing it. Fixed gains are the
-    // steady-state Kalman for constant process/measurement noise — a full
-    // Kalman buys nothing here. Prediction is clamped and frozen on
-    // stillness/reversal: predictors overshoot exactly when motion stops.
+    // α-β lead predictor (main-confined, tick context): masks the residual
+    // 30-80ms phase lag so the fold leads the finger instead of trailing it.
+    // Deliberately α-β, never α-β-γ: over a ~60ms lead, accel contributes
+    // ½·a·t² ≤ ~2° even at physical clamp — sub-frame — while the γ/dt² path
+    // amplifies integer-quantum noise 144× across the 10→120Hz dt swing.
+    // Deleted on evidence, not tuned on hope. Lead retuned to 60ms to match
+    // the easing lag (τ=1/followSpeed≈62ms): prediction must dominate lag,
+    // not trail it.
     private var predX: Double = 120.0
     private var predV: Double = 0.0
-    private var predA: Double = 0.0
-    private var predTime: CFTimeInterval = 0
-    private static let predLeadTime: Double = 0.045
+    private var stillnessConfirmed = false
+    private static let predLeadTime: Double = 0.06
     private static let predMaxLead: Double = 8.0
-    private static let predMaxAccel: Double = 2000.0
 
-    /// α-β-γ filter step on a fresh HID sample. Gains are the steady-state
-    /// Kalman for constant process/measurement noise — a full Kalman buys
-    /// nothing here. Accel is clamped: dt² in the γ denominator explodes on
-    /// near-simultaneous samples.
+    /// α-β step on a fresh HID sample. β is scheduled with dt: fixed gains
+    /// are only steady-state-optimal at a fixed rate, and our clock swings
+    /// 12×. Snaps (never predicts) through discontinuities. Reuses
+    /// prevConsumedSampleTime as its clock — one timestamp, one dt.
     private func updatePredictor(angle: Double, sampleTime: CFTimeInterval) {
-        if predTime <= 0 {
+        let lastT = prevConsumedSampleTime
+        if lastT <= 0 {
             predX = angle
             predV = 0
-            predA = 0
-            predTime = sampleTime
             return
         }
-        let dt = max(sampleTime - predTime, 1.0 / 240.0)
-        // Discontinuity (sleep/wake gap, re-enumeration): snap, never predict
-        // through it — a 100° jump would fling the lead angle.
-        if dt > 1.0 || abs(angle - predX) > 30.0 {
+        let rawDt = sampleTime - lastT
+        // Backwards/duplicate delivery or sleep/wake gap: re-init, never
+        // divide by zero or a negative dt (sign-flipped, amplified kick).
+        guard rawDt > 0, rawDt <= 1.0 else {
             predX = angle
             predV = 0
-            predA = 0
-            predTime = sampleTime
             return
         }
-        // Predict to the sample instant, then correct with the measurement.
-        let xPred = predX + predV * dt + 0.5 * predA * dt * dt
-        let vPred = predV + predA * dt
+        let dt = max(rawDt, 1.0 / 240.0)
+        // Velocity gate, not position jump: a 300°/s slam legitimately covers
+        // 30°+ per 10Hz tick; only unphysical slew snaps the filter.
+        if abs(angle - predX) / dt > 1200.0 {
+            predX = angle
+            predV = 0
+            return
+        }
+        // Predict to the sample instant, then correct. β scaled to dt
+        // relative to the 60Hz nominal design point: consistent noise gain.
+        let beta = min(max(0.08 * dt * 60.0, 0.02), 0.3)
+        let xPred = predX + predV * dt
         let residual = angle - xPred
         predX = xPred + 0.35 * residual
-        predV = vPred + 0.08 * residual / dt
-        predA = min(max(predA + 0.005 * residual / (0.5 * dt * dt),
-                        -Self.predMaxAccel), Self.predMaxAccel)
-        predTime = sampleTime
+        predV += beta * residual / dt
     }
 
-    /// Lead-angle prediction driving targetTurn. Clamped to ±8° of the last
-    /// measured sample and to physical range; frozen to measured once
-    /// stillness engages, so it can never overshoot a stop or a reversal.
-    /// Capture thresholds and published angles stay on measured values —
-    /// only the rendered turn leads.
-    private func predictedAngle(measured: Double) -> Double {
-        guard stillSince == nil else { return measured }
+    /// Lead angle driving targetTurn. Frozen to measured unless actively
+    /// tracking (fresh samples flowing AND stillness not confirmed) — it can
+    /// never overshoot a stop, a reversal, or a sensor dropout. Notably, slow
+    /// stared-at folds keep their lead: the gate is confirmed stillness
+    /// (200ms), not the first quiet tick. Capture thresholds and published
+    /// angles stay on measured values; only the rendered turn leads.
+    private func predictedAngle(measured: Double, tracking: Bool) -> Double {
+        guard tracking, !stillnessConfirmed else { return measured }
         let lead = predX + predV * Self.predLeadTime
         return min(max(lead, measured - Self.predMaxLead, 0.0),
                    measured + Self.predMaxLead, 180.0)
@@ -638,10 +642,12 @@ public final class LidSensor {
                 if isMovingDownward {
                     isActivelyClosing = true
                     stillSince = nil
+                    stillnessConfirmed = false
                 } else if isMovingUpward {
                     isActivelyClosing = false
                     hasPreArmedInThisMotion = false
                     stillSince = nil
+                    stillnessConfirmed = false
                 } else {
                     // Time-based stillness (200ms), not frame-counted: the
                     // adaptive clock runs 10..120Hz, so frame counts lie.
@@ -649,10 +655,10 @@ public final class LidSensor {
                         stillSince = nowTick
                     } else if nowTick - stillSince! > 0.2 {
                         isActivelyClosing = false
+                        stillnessConfirmed = true
                         // Freeze the predictor with the stop: stale velocity
                         // would otherwise overshoot into the reversal.
                         predV = 0
-                        predA = 0
                     }
                 }
 
@@ -682,7 +688,9 @@ public final class LidSensor {
             
             // Target turn leads the finger: predicted angle masks HID + pipeline
             // latency. Measured angle still drives capture thresholds and UI.
-            targetTurn = settings.normalizedTurn(for: predictedAngle(measured: currentRawAngle))
+            // tracking=readOK: during dropout the predictor coasts on frozen
+            // velocity, so the turn holds measured until samples resume.
+            targetTurn = settings.normalizedTurn(for: predictedAngle(measured: currentRawAngle, tracking: readOK))
             
             // Follow easing physics
             let now = CACurrentMediaTime()
