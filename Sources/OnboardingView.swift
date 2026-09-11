@@ -21,8 +21,8 @@ public struct OnboardingView: View {
                 VStack(spacing: 4) {
                     Text("Welcome to macTilt")
                         .font(.system(size: 26, weight: .bold))
-                    
-                    Text("Realistic 3D clamshell folding animation for your MacBook display.")
+
+                    Text("Watch your screen bend like paper as you close your MacBook.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
@@ -36,22 +36,22 @@ public struct OnboardingView: View {
                 FeatureRow(
                     icon: "laptopcomputer",
                     iconColor: .blue,
-                    title: "Physical Clamshell Folding",
-                    subtitle: "Synchronized 1:1 with Apple's internal lid angle sensor. Folds seamlessly from up to down as you close the lid."
+                    title: "Follows your hands",
+                    subtitle: "The picture bends exactly with your lid — open, halfway, closed."
                 )
-                
+
                 FeatureRow(
                     icon: "battery.100.bolt",
                     iconColor: .green,
-                    title: "Zero Idle Battery Impact",
-                    subtitle: "100% dormant during normal use with zero background polling. Captures are pre-armed strictly during physical closing motion."
+                    title: "Sips no battery",
+                    subtitle: "Does nothing while you work. Wakes only as you close the lid."
                 )
-                
+
                 FeatureRow(
                     icon: "record.circle.fill",
                     iconColor: .orange,
                     title: "Screen Recording Permission",
-                    subtitle: "Freezes your active workspace into 3D space when closing. Processed strictly on-device with no network access."
+                    subtitle: "Takes one picture of your desktop to bend it. Never leaves this Mac."
                 )
             }
             .padding(.horizontal, 28)
@@ -75,25 +75,25 @@ public struct OnboardingView: View {
                             ScreenCapture.shared.requestPermission()
                             ScreenCapture.shared.openSettings()
                         }) {
-                            Text("Grant Access...")
+                            Text("Allow in System Settings…")
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                     }
                 }
-                
+
                 if !settings.hasScreenRecordingPermission {
                     HStack {
-                        Text("After toggling access in System Settings, click Relaunch to apply.")
+                        Text("After you switch it on in System Settings, quit and reopen macTilt.")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        
+
                         Spacer()
-                        
+
                         Button(action: {
                             ScreenCapture.shared.relaunchApp()
                         }) {
-                            Label("Relaunch", systemImage: "arrow.clockwise")
+                            Label("Quit and Reopen", systemImage: "arrow.clockwise")
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.mini)

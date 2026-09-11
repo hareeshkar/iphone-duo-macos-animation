@@ -10,6 +10,7 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
     private var onboardingWindow: NSWindow?
     private var angleMenuItem: NSMenuItem?
     private var updateMenuItem: NSMenuItem?
+    private var testToggleItem: NSMenuItem?
     private var lastAngle: Double = 120.0
     private var lastIsConnected: Bool = false
     
@@ -28,40 +29,41 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
         
         let menu = NSMenu()
         
-        let header = NSMenuItem(title: "macTilt Clamshell Animation", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "macTilt", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
-        
-        let updateItem = NSMenuItem(title: "✨ Update Available", action: #selector(openLatestRelease), keyEquivalent: "")
+
+        let updateItem = NSMenuItem(title: "Download macTilt Update…", action: #selector(openLatestRelease), keyEquivalent: "")
         updateItem.target = self
         updateItem.isHidden = true
         self.updateMenuItem = updateItem
         menu.addItem(updateItem)
-        
-        let angleItem = NSMenuItem(title: "Lid Sensor: Initializing...", action: nil, keyEquivalent: "")
+
+        let angleItem = NSMenuItem(title: "Lid: opening…", action: nil, keyEquivalent: "")
         angleItem.isEnabled = false
         self.angleMenuItem = angleItem
         menu.addItem(angleItem)
-        
+
         menu.addItem(NSMenuItem.separator())
-        
-        let openSettings = NSMenuItem(title: "Control Panel & Settings...", action: #selector(openControlPanel), keyEquivalent: ",")
+
+        let openSettings = NSMenuItem(title: "macTilt Settings…", action: #selector(openControlPanel), keyEquivalent: ",")
         openSettings.target = self
         menu.addItem(openSettings)
-        
-        let welcomeItem = NSMenuItem(title: "Welcome Guide & Permissions...", action: #selector(openOnboardingWindow), keyEquivalent: "")
+
+        let welcomeItem = NSMenuItem(title: "Welcome Guide…", action: #selector(openOnboardingWindow), keyEquivalent: "")
         welcomeItem.target = self
         menu.addItem(welcomeItem)
-        
-        let previewItem = NSMenuItem(title: "Trigger Fold Animation Preview", action: #selector(triggerFoldPreview), keyEquivalent: "p")
+
+        let previewItem = NSMenuItem(title: "Play Close-and-Open Preview", action: #selector(triggerFoldPreview), keyEquivalent: "p")
         previewItem.target = self
         menu.addItem(previewItem)
-        
-        let testToggle = NSMenuItem(title: "Toggle Test Preview Slider", action: #selector(toggleTestMode), keyEquivalent: "t")
+
+        let testToggle = NSMenuItem(title: "Show Preview Slider", action: #selector(toggleTestMode), keyEquivalent: "t")
         testToggle.target = self
+        self.testToggleItem = testToggle
         menu.addItem(testToggle)
-        
-        let captureItem = NSMenuItem(title: "Re-capture Screen Snapshot", action: #selector(recaptureScreen), keyEquivalent: "r")
+
+        let captureItem = NSMenuItem(title: "Take a Fresh Screen Picture", action: #selector(recaptureScreen), keyEquivalent: "r")
         captureItem.target = self
         menu.addItem(captureItem)
         
@@ -84,7 +86,7 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
     public func updateAngleDisplay(angle: Double, isConnected: Bool) {
         lastAngle = angle
         lastIsConnected = isConnected
-        
+
         if let button = statusItem?.button {
             if AppSettings.shared.showAngleInMenuBar {
                 if AppSettings.shared.isHardwareSensor {
@@ -95,18 +97,19 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
             } else {
                 button.title = ""
             }
+            button.setAccessibilityLabel("macTilt, lid at \(Int(angle)) degrees")
         }
-        
+
         if let angleItem = self.angleMenuItem {
             if isConnected {
                 if AppSettings.shared.isHardwareSensor {
-                    let status = AppSettings.shared.isClosing ? "Closing (\(Int(angle))°)" : "Open (\(Int(angle))°)"
-                    angleItem.title = "Sensor: \(status)"
+                    let status = AppSettings.shared.isClosing ? "closing" : "open"
+                    angleItem.title = "Lid: \(Int(angle))° — \(status)"
                 } else {
-                    angleItem.title = "Mode: Clamshell Auto-Animation"
+                    angleItem.title = "Lid: automatic animation"
                 }
             } else {
-                angleItem.title = "Lid Sensor: Disconnected"
+                angleItem.title = "Lid sensor off"
             }
         }
     }
@@ -129,7 +132,7 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
         }
         
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 680),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -201,6 +204,7 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
         } else {
             AppSettings.shared.testTurnValue = 0.0
         }
+        testToggleItem?.title = current ? "Show Preview Slider" : "Hide Preview Slider"
     }
     
     @objc @MainActor private func recaptureScreen() {
@@ -210,7 +214,7 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
     public func refreshUpdateMenuState() {
         DispatchQueue.main.async {
             if UpdateChecker.shared.updateAvailable {
-                self.updateMenuItem?.title = "✨ Download \(UpdateChecker.shared.latestVersion) Update..."
+                self.updateMenuItem?.title = "Download macTilt \(UpdateChecker.shared.latestVersion)…"
                 self.updateMenuItem?.isHidden = false
             } else {
                 self.updateMenuItem?.isHidden = true
