@@ -9,23 +9,46 @@ public final class OverlayWindowController: NSObject {
     private var isCapturing = false
     private var wasZeroTurn = true
     private var sleepObservers: [NSObjectProtocol] = []
+    private var displayReconfigObserver: NSObjectProtocol?
 
     // Clamshell truthfulness: no 3D unfold geometry on open (the real desktop
-    // is already there). Open path is a short fade-only handoff.
-    private var openFadeFramesRemaining = 0
-    private static let openFadeFramesTotal = 5
+    // is already there). Open path is a short TIME-based fade-only handoff —
+    // frame-counted fades swing 40ms..500ms across the 10..120Hz clock.
+    private var openFadeDeadline: CFTimeInterval = 0
+    private static let openFadeDuration: CFTimeInterval = 0.09
 
-    // Capture dedupe: skip texture re-upload when the frame is unchanged.
-    private var lastCaptureHash: UInt64 = 0
+    // Scoped anti-nap: held only while the fold is visible, never at idle.
+    private var overlayActivity: NSObjectProtocol?
+
+    // NSScreen.screens IPCs per call — cache, refresh on reconfiguration.
+    private var cachedScreenCount: Int = 1
     
     public override init() {
         super.init()
         setupWindow()
         setupSleepObservers()
-        
+        cachedScreenCount = NSScreen.screens.count
+        displayReconfigObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleDisplayReconfiguration()
+        }
+
         // Connect intelligent hardware pre-arming
         LidSensor.shared.onPreArmCapture = { [weak self] in
-            self?.captureScreenAsync()
+            self?.captureScreenAsync(fullResolution: true)
+        }
+    }
+
+    private func handleDisplayReconfiguration() {
+        cachedScreenCount = NSScreen.screens.count
+        // Mode changes reuse displayIDs with new geometry — cached filters lie.
+        ScreenCapture.shared.invalidateCaches()
+        // Refit the overlay to the (possibly new) main screen geometry.
+        if let win = window, let screen = NSScreen.main ?? NSScreen.screens.first {
+            win.setFrame(screen.frame, display: false)
         }
     }
     
@@ -50,6 +73,12 @@ public final class OverlayWindowController: NSObject {
         let ws = NSWorkspace.shared.notificationCenter
         for token in sleepObservers {
             ws.removeObserver(token)
+        }
+        if let token = displayReconfigObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+        if let activity = overlayActivity {
+            ProcessInfo.processInfo.endActivity(activity)
         }
     }
     
@@ -103,10 +132,8 @@ public final class OverlayWindowController: NSObject {
         self.metalView = mtkView
         
         // One-time initial image load in background during app launch
-        Task {
+        Task(priority: .utility) {
             if let img = await ScreenCapture.shared.fetchImage() {
-                let hash = Self.quickHash(img)
-                self.lastCaptureHash = hash
                 await MainActor.run {
                     self.metalView?.updateImage(img)
                     AppSettings.shared.lastCaptureDate = Date()
@@ -119,54 +146,94 @@ public final class OverlayWindowController: NSObject {
     public func update(turn: Double, angle: Double) {
         guard let win = self.window, let mv = self.metalView else { return }
 
-        // External display attached = clamshell desktop mode. The internal panel
-        // isn't the workspace — suppress the fold overlay entirely.
-        if NSScreen.screens.count > 1 {
+        // Suppress only for genuine clamshell desktop mode: external attached
+        // AND the internal panel asleep. Mirrored presenting (panel awake)
+        // keeps the effect — the lid is still physically closing.
+        if cachedScreenCount > 1 && Self.isInternalDisplayAsleep() {
             if !wasZeroTurn {
                 stopOverlay()
             }
             AppSettings.shared.isScreenCaptureDormant = true
             return
         }
-        
+
         mv.currentTurn = Float(turn)
         mv.blurStrength = Float(AppSettings.shared.blurStrength)
         mv.reflectionIntensity = Float(AppSettings.shared.reflectionIntensity)
-        mv.updateFrameRate(turn: Float(turn))
-        
-        // Only trigger when closing and turn > 0
-        if turn > 0.0001 {
-            openFadeFramesRemaining = 0
+        // Snapshot velocity on main: draw() must never read LidSensor off-main.
+        mv.motionBoost = MetalFoldView.velocityBlurBoost()
+
+        // Hysteresis: show above 0.0005, hide below 0.0001. Kills
+        // WindowServer scene-graph flapping from HID jitter near open.
+        if turn > 0.0005 {
+            openFadeDeadline = 0
             if wasZeroTurn {
                 wasZeroTurn = false
                 win.alphaValue = 1.0
+                // Fresh filter: windows created since the cache (including our
+                // own overlay) must be in the exclusion list, or the capture
+                // photographs our last frozen frame — feedback loop.
+                ScreenCapture.shared.invalidateFilterCache()
                 mv.resumeRendering()
                 win.orderFrontRegardless()
+                beginOverlayActivity()
                 if AppSettings.shared.enableLockScreenPriority {
                     SkyLightOperator.shared.delegateWindow(win)
                 }
+                ensureTexture()
                 // If pre-arm hasn't finished or was skipped, trigger snapshot if not already active
                 if AppSettings.shared.imageSourceMode == .liveCapture {
-                    captureScreenAsync()
+                    captureScreenAsync(fullResolution: turn < 0.2)
                 }
             }
             mv.isPaused = false
-        } else {
+        } else if turn < 0.0001 {
             if !wasZeroTurn {
-                // Safe open handoff: fade the frozen frame out over a few ticks
-                // instead of revealing 3D unfold geometry that would fight the
-                // real desktop. Lock-screen opens are suppressed by handleWake.
-                if openFadeFramesRemaining == 0 {
-                    openFadeFramesRemaining = Self.openFadeFramesTotal
+                // Safe open handoff: TIME-based fade (90ms) of the frozen frame
+                // over the live desktop. The real desktop is already there —
+                // no 3D unfold geometry to fight it.
+                let now = CACurrentMediaTime()
+                if openFadeDeadline == 0 {
+                    openFadeDeadline = now + Self.openFadeDuration
                 }
-                if openFadeFramesRemaining > 1 {
-                    openFadeFramesRemaining -= 1
-                    win.alphaValue = Double(openFadeFramesRemaining) / Double(Self.openFadeFramesTotal)
+                if now < openFadeDeadline {
+                    let remaining = (openFadeDeadline - now) / Self.openFadeDuration
+                    win.alphaValue = max(0.0, min(1.0, remaining))
                     mv.currentTurn = 0.0
                     mv.isPaused = false
                 } else {
                     hideOverlay()
                 }
+            }
+        }
+        // Between thresholds: hold last state (hysteresis band), no flapping.
+    }
+
+    /// The internal panel is asleep while an external display drives the
+    /// desktop — the definition of clamshell mode worth suppressing for.
+    private static func isInternalDisplayAsleep() -> Bool {
+        CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+
+    private func beginOverlayActivity() {
+        if overlayActivity == nil {
+            overlayActivity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "macTilt fold animation visible"
+            )
+        }
+    }
+
+    /// suspendRendering nils the texture — reload it on show so the fold
+    /// never renders an empty frame.
+    private func ensureTexture() {
+        guard let mv = metalView, !mv.hasTexture else { return }
+        // @MainActor-isolated task: no cross-actor self capture. The await
+        // suspends (never blocks main); updateImage backgrounds decode/upload
+        // onto the .utility upload queue internally.
+        Task { @MainActor [weak self] in
+            if let img = await ScreenCapture.shared.fetchImage() {
+                self?.metalView?.updateImage(img)
             }
         }
     }
@@ -181,10 +248,14 @@ public final class OverlayWindowController: NSObject {
     /// fullscreen transparent topmost window forever — battery tax.
     private func hideOverlay() {
         wasZeroTurn = true
-        openFadeFramesRemaining = 0
+        openFadeDeadline = 0
         window?.alphaValue = 0.0
         window?.orderOut(nil)
         metalView?.suspendRendering()
+        if let activity = overlayActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            overlayActivity = nil
+        }
     }
     
     public func updateWindowLevel() {
@@ -196,23 +267,19 @@ public final class OverlayWindowController: NSObject {
         }
     }
     
-    public func captureScreenAsync() {
+    public func captureScreenAsync(fullResolution: Bool = false) {
         guard !isCapturing else { return }
         isCapturing = true
         AppSettings.shared.isScreenCaptureDormant = false
-        
-        Task {
-            if let image = await ScreenCapture.shared.fetchImage() {
-                let hash = Self.quickHash(image)
-                let unchanged = hash == self.lastCaptureHash
-                if !unchanged {
-                    self.lastCaptureHash = hash
-                }
+
+        // Utility QoS: throughput work. Upload itself is ordered + cheap now,
+        // so no pixel hashing — the old FNV bridged the full IOSurface-backed
+        // Data (7-30MB readback) to "save" an already-backgrounded upload,
+        // and strided sampling could alias into stale frames. Always upload.
+        Task(priority: .utility) {
+            if let image = await ScreenCapture.shared.fetchImage(scaleFactor: fullResolution ? 1.0 : 0.5) {
                 await MainActor.run {
-                    // Skip texture re-upload + mip regen when the frame is unchanged.
-                    if !unchanged {
-                        self.metalView?.updateImage(image)
-                    }
+                    self.metalView?.updateImage(image)
                     self.isCapturing = false
                     AppSettings.shared.lastCaptureDate = Date()
                     AppSettings.shared.isScreenCaptureDormant = true
@@ -224,31 +291,5 @@ public final class OverlayWindowController: NSObject {
                 }
             }
         }
-    }
-
-    // MARK: - Capture dedupe
-
-    /// Cheap FNV-1a over dimensions + strided pixel samples. Runs off-main inside
-    /// the capture Task; ~256 samples regardless of resolution.
-    static func quickHash(_ image: CGImage) -> UInt64 {
-        var hash: UInt64 = 14_695_981_039_372_096_185
-        func mix(_ v: UInt64) {
-            hash ^= v
-            hash = hash &* 1_099_511_628_211
-        }
-        mix(UInt64(image.width))
-        mix(UInt64(image.height))
-        mix(UInt64(image.bytesPerRow))
-        guard let provider = image.dataProvider,
-              let data = provider.data as Data? else {
-            return hash
-        }
-        let stride = max(1, data.count / 256)
-        var i = 0
-        while i < data.count {
-            mix(UInt64(data[i]))
-            i += stride
-        }
-        return hash
     }
 }
