@@ -42,10 +42,19 @@ public enum ImageSourceMode: Int, CaseIterable, Identifiable {
     
     public var title: String {
         switch self {
-        case .liveCapture: return "Live Screen Capture"
-        case .desktopWallpaper: return "Desktop Wallpaper"
-        case .bundledArtwork: return "Bundled Artwork"
-        case .customImage: return "Custom Image"
+        case .liveCapture: return "My Open Windows"
+        case .desktopWallpaper: return "My Wallpaper"
+        case .bundledArtwork: return "Included Art"
+        case .customImage: return "My Own Photo"
+        }
+    }
+
+    public var help: String {
+        switch self {
+        case .liveCapture: return "Bends your real open windows. Needs Screen Permission above."
+        case .desktopWallpaper: return "Bends your current desktop picture. No permission needed."
+        case .bundledArtwork: return "Bends the art included with macTilt. No permission needed."
+        case .customImage: return "Bends any photo you pick on your Mac."
         }
     }
 }
