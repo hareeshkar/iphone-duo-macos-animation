@@ -185,11 +185,13 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
     
     public func windowWillClose(_ notification: Notification) {
         // When the control panel is dismissed, always clear test mode so the
-        // fold overlay doesn't stay frozen on screen.
+        // fold overlay doesn't stay frozen on screen. Belt-and-braces with
+        // SwiftUI onDisappear below: either path fully hides the overlay.
         if AppSettings.shared.isTestModeActive {
             AppSettings.shared.isTestModeActive = false
             AppSettings.shared.testTurnValue = 0.0
         }
+        OverlayWindowController.shared.stopOverlay()
     }
     
     @objc private func triggerFoldPreview() {
@@ -201,6 +203,9 @@ public final class MenuBarController: NSObject, NSWindowDelegate {
         AppSettings.shared.isTestModeActive = !current
         if !current {
             AppSettings.shared.testTurnValue = 0.5
+            // Same one-frame priming the in-panel toggle performs: without
+            // it the first scrub renders stale-or-nothing until a fetch lands.
+            OverlayWindowController.shared.captureScreenAsync()
         } else {
             AppSettings.shared.testTurnValue = 0.0
         }

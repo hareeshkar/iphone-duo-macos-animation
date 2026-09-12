@@ -20,7 +20,6 @@ public struct LiquidGlassControlPanel: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var copiedResetCommand: Bool = false
     @State private var showingPermissionTroubleshooting: Bool = false
-    @State private var isApplyingPreset = false
     private let resetCommand = "tccutil reset ScreenCapture com.lqsky7.mactilt"
     
     public init() {}
@@ -165,7 +164,7 @@ public struct LiquidGlassControlPanel: View {
                     .font(.subheadline)
                     .fontWeight(.medium)
 
-                InfoButton("Screen Recording", content: "Lets macTilt picture your open desktop so it can bend it as you close the lid. Everything stays on this Mac.")
+                InfoButton("Screen Recording", content: "Takes a still of your open desktop so macTilt can bend it as you close the lid. Everything stays on this Mac.")
 
                 Spacer()
 
@@ -176,6 +175,7 @@ public struct LiquidGlassControlPanel: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .accessibilityLabel("Check again for permission")
                 .help("Check again for permission")
 
                 if !settings.hasScreenRecordingPermission {
@@ -197,6 +197,7 @@ public struct LiquidGlassControlPanel: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .accessibilityLabel("Fix permission problems")
                     .help("Fix permission problems")
                     .popover(isPresented: $showingPermissionTroubleshooting, arrowEdge: .trailing) {
                         VStack(alignment: .leading, spacing: 10) {
@@ -279,7 +280,7 @@ public struct LiquidGlassControlPanel: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Instant first frame")
                         .font(.subheadline)
-                    Text("Keeps the camera warm so the bend starts at once.")
+                    Text("Keeps a fresh picture ready so the bend starts at once.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -371,13 +372,15 @@ public struct LiquidGlassControlPanel: View {
                     .labelsHidden()
                     .pickerStyle(.menu)
                     .frame(width: 170)
+                    .accessibilityLabel("Animation shows")
                     .help("What picture bends when you close the lid")
                 }
 
-                Text("“My Open Windows” needs Screen Permission above.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .opacity(settings.imageSourceMode == .liveCapture ? 1 : 0)
+                if settings.imageSourceMode == .liveCapture {
+                    Text("“My Open Windows” needs Screen Recording Permission above.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 if settings.imageSourceMode == .customImage {
                     HStack {
@@ -442,19 +445,19 @@ public struct LiquidGlassControlPanel: View {
                                 .clipShape(Capsule())
                         }
                     }
-                    Picker("", selection: $settings.feelPreset) {
+                    Picker("", selection: Binding(
+                        get: { settings.feelPreset },
+                        set: { settings.applyFeelPreset($0) }
+                    )) {
                         Text(FeelPreset.gentle.title).tag(FeelPreset.gentle)
                         Text(FeelPreset.balanced.title).tag(FeelPreset.balanced)
                         Text(FeelPreset.sharp.title).tag(FeelPreset.sharp)
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                    .help("Pick how the bend feels: calm, balanced, or instant")
-                    .onChange(of: settings.feelPreset) { _, newValue in
-                        isApplyingPreset = true
-                        settings.applyFeelPreset(newValue)
-                        DispatchQueue.main.async { isApplyingPreset = false }
-                    }
+                    .accessibilityLabel("Feel")
+                    .accessibilityHint("Pick how the bend feels: gentle, balanced, or sharp")
+                    .help("Pick how the bend feels: gentle, balanced, or sharp")
                     Text("Pick a vibe, then fine-tune below.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -468,7 +471,7 @@ public struct LiquidGlassControlPanel: View {
                         Text("Sticks to your lid")
                             .font(.subheadline)
 
-                        InfoButton("Sticks To Your Lid", content: "How tightly the picture follows your hand. Higher sticks closer; lower trails softly. Tracking and anticipation stay matched automatically.")
+                        InfoButton("Sticks To Your Lid", content: "How tightly the picture follows your hand. Higher sticks closer; lower trails softly.")
 
                         Spacer()
 
@@ -482,7 +485,7 @@ public struct LiquidGlassControlPanel: View {
                         .accessibilityValue("\(Int(settings.followSpeed)), \(followSuffix)")
                         .help("Higher sticks closer to your hand; lower trails softly")
                         .onChange(of: settings.followSpeed) { _, _ in
-                            if !isApplyingPreset { settings.feelPreset = .custom }
+                            settings.reconcilePreset()
                         }
                     HStack {
                         Text("Floaty")
@@ -511,10 +514,10 @@ public struct LiquidGlassControlPanel: View {
                         }
                         Slider(value: $settings.blurStrength, in: 0.2...2.0, step: 0.1)
                             .accessibilityLabel("Softness while bending")
-                            .accessibilityValue("\(blurSuffix)")
+                            .accessibilityValue("\(String(format: "%.1f", settings.blurStrength)), \(blurSuffix)")
                             .help("Adds a soft blur mid-bend so motion looks smooth")
                             .onChange(of: settings.blurStrength) { _, _ in
-                                if !isApplyingPreset { settings.feelPreset = .custom }
+                                settings.reconcilePreset()
                             }
                     }
 
@@ -533,7 +536,7 @@ public struct LiquidGlassControlPanel: View {
                             .accessibilityValue(shineValueText)
                             .help("Adds a light streak across the fold, like glass catching light")
                             .onChange(of: settings.reflectionIntensity) { _, _ in
-                                if !isApplyingPreset { settings.feelPreset = .custom }
+                                settings.reconcilePreset()
                             }
                     }
                 }
@@ -543,7 +546,8 @@ public struct LiquidGlassControlPanel: View {
 
     private var followSuffix: String {
         if settings.followSpeed <= 10 { return "floaty" }
-        if settings.followSpeed <= 20 { return "snappy" }
+        if settings.followSpeed <= 16 { return "smooth" }
+        if settings.followSpeed <= 24 { return "snappy" }
         return "glued"
     }
 
@@ -572,7 +576,7 @@ public struct LiquidGlassControlPanel: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    InfoButton("Lock Screen Wake", content: "macOS hides the lock screen for safety. Tip: in System Settings › Lock Screen, set “Require password” to “After 1 minute” to see the unbend.")
+                    InfoButton("Lock Screen Wake", content: "macOS hides the lock screen for safety. Tip: in System Settings › Lock Screen, set “Require password” to “After 1 minute” to see the animation when you open the lid.")
 
                     Spacer()
 
@@ -587,7 +591,7 @@ public struct LiquidGlassControlPanel: View {
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Try the close-and-open movie")
+                        Text("Try the close-and-open preview")
                             .font(.subheadline)
                         Text("Plays the full bend on demand — no need to move your lid.")
                             .font(.caption)
@@ -645,7 +649,7 @@ public struct LiquidGlassControlPanel: View {
                             Text("How far closed")
                                 .font(.subheadline)
                             Spacer()
-                            Text("\(Int(settings.testTurnValue * 100))% (≈ \(Int(120 - settings.testTurnValue * 85))°)")
+                            Text("\(Int(settings.testTurnValue * 100))% (≈ \(Int(settings.startTiltAngle - settings.testTurnValue * (settings.startTiltAngle - settings.endTiltAngle)))°)")
                                 .font(.subheadline)
                                 .fontWeight(.bold)
                                 .monospacedDigit()
@@ -679,7 +683,7 @@ public struct LiquidGlassControlPanel: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
                 }
             }
         }
@@ -776,7 +780,7 @@ public struct LiquidGlassControlPanel: View {
                 .toggleStyle(.switch)
 
                 if let lastCheck = updater.lastCheckDate {
-                    Text("Last checked \(lastCheck, style: .relative) ago.")
+                    Text("Last checked \(lastCheck, style: .relative).")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
@@ -795,6 +799,8 @@ public struct LiquidGlassControlPanel: View {
                 settings.customImagePath = ""
                 settings.enableWarmStream = true
                 settings.showAngleInMenuBar = true
+                settings.enableLockScreenPriority = true
+                settings.automaticallyCheckForUpdates = true
                 settings.isTestModeActive = false
                 settings.testTurnValue = 0.0
             }

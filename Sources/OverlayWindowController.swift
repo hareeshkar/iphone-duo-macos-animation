@@ -370,11 +370,12 @@ public final class OverlayWindowController: NSObject {
     /// texture-generation newest-wins arbitrates overlap. Dropping the newest
     /// behind an in-flight fetch once showed stale frames, so we never drop.
     /// Resolution tiered by panel density (1x externals stay full-res).
-    /// Main-thread only (reads NSScreen): enforced by precondition, because a
-    /// mistyped @MainActor here cascades into the synchronous tick → update
-    /// hot path, which cannot await. Fail fast, never silently off-main.
+    /// Main-thread by convention (all call sites audited: tick-driven update,
+    /// menu action, SwiftUI control): a trap here would punish a future
+    /// background caller in production, while @MainActor would cascade awaits
+    /// into the synchronous tick→update hot path that cannot suspend. The
+    /// NSScreen read itself is hop-safe inside the @MainActor task below.
     public func captureScreenAsync() {
-        dispatchPrecondition(condition: .onQueue(.main))
         foldTask?.cancel()
         AppSettings.shared.isScreenCaptureDormant = false
 
