@@ -22,10 +22,12 @@ public enum FeelPreset: Int, CaseIterable, Identifiable {
     /// Joint follow/blur/shine recipe. Follow and prediction lead stay
     /// coupled by construction (lead derives from follow in LidSensor), so
     /// no preset can decouple tracking bandwidth from anticipation into
-    /// floaty-fake territory. Values validated in the physics review.
+    /// floaty-fake territory. Values validated in the physics review; Gentle
+    /// sits at 13 (inside the lead formula's exact band, and out of the
+    /// "snappy" suffix band so the label never contradicts the preset).
     public var recipe: (follow: Double, blur: Double, shine: Double) {
         switch self {
-        case .gentle: return (11.0, 0.8, 0.4)
+        case .gentle: return (13.0, 0.8, 0.4)
         case .balanced: return (16.0, 0.5, 0.0)
         case .sharp: return (24.0, 0.2, 0.0)
         case .custom: return (16.0, 0.5, 0.0)
@@ -139,8 +141,8 @@ public final class AppSettings: ObservableObject {
         }
     }
 
-    /// Apply a feel preset's joint recipe. Sliders moving afterwards flip the
-    /// picker to Custom in the view — presets are starting points, never locks.
+    /// Apply a feel preset's joint recipe. Presets are starting points, never
+    /// locks: any later slider move reconciles the badge via reconcilePreset.
     public func applyFeelPreset(_ preset: FeelPreset) {
         guard preset != .custom else { return }
         let recipe = preset.recipe
@@ -148,6 +150,24 @@ public final class AppSettings: ObservableObject {
         blurStrength = recipe.blur
         reflectionIntensity = recipe.shine
         feelPreset = preset
+    }
+
+    /// Reconcile the preset badge with actual slider values. Value-based, not
+    /// flag-based: a suppression flag races SwiftUI's async onChange delivery
+    /// (stale closures see the old flag; the async clear opens a flip window),
+    /// while values cannot lie. Epsilon compare: slider-stepped doubles can
+    /// differ from literals by 1 ulp.
+    public func reconcilePreset() {
+        for preset in [FeelPreset.gentle, .balanced, .sharp] {
+            let r = preset.recipe
+            if abs(followSpeed - r.follow) < 1e-9,
+               abs(blurStrength - r.blur) < 1e-9,
+               abs(reflectionIntensity - r.shine) < 1e-9 {
+                if feelPreset != preset { feelPreset = preset }
+                return
+            }
+        }
+        if feelPreset != .custom { feelPreset = .custom }
     }
     
     // MARK: - Real-time State

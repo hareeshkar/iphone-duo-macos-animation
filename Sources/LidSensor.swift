@@ -71,9 +71,12 @@ public final class LidSensor {
     private static let predMaxLead: Double = 8.0
 
     /// Prediction lead derived from follow speed: T_lead ≈ τ − 2.5ms clamped
-    /// to the validated 40–75ms band. Derived, never stored or exposed alone —
-    /// decoupling tracking bandwidth from anticipation is exactly how a fold
-    /// turns floaty-fake, so the construction makes it unrepresentable.
+    /// to the validated 40–75ms band. The formula is exact for follow
+    /// ≈12.9–23.5 (all three presets live inside it); outside, the clamp
+    /// degrades gracefully — laggy, never overshooting (low end) or bounded
+    /// by the ±8° lead clamp (high end). Derived, never stored or exposed
+    /// alone: decoupling tracking bandwidth from anticipation is exactly how
+    /// a fold turns floaty-fake, so the construction makes it unrepresentable.
     private static func effectiveLeadTime(followSpeed: Double) -> Double {
         min(max(1.0 / max(8.0, followSpeed) - 0.0025, 0.04), 0.075)
     }

@@ -25,9 +25,15 @@ import Metal
 public final class StreamCapture: NSObject, @unchecked Sendable {
     public static let shared = StreamCapture()
 
-    /// Kill switch: false forces the one-shot path everywhere. Flip without
-    /// touching call sites if the stream ever misbehaves on a given machine.
-    public static var fastPathEnabled = true
+    /// Kill switch: false forces the one-shot path everywhere. Lock-guarded:
+    /// written from SwiftUI toggles (main), read on the stream queue — a
+    /// plain static Bool would be a cross-thread race TSan flags.
+    private static var _fastPathEnabled = true
+    private static let flagLock = NSLock()
+    public static var fastPathEnabled: Bool {
+        get { flagLock.lock(); defer { flagLock.unlock() }; return _fastPathEnabled }
+        set { flagLock.lock(); defer { flagLock.unlock() }; _fastPathEnabled = newValue }
+    }
 
     private let lock = NSLock()
     private var stream: SCStream?
